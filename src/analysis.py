@@ -191,11 +191,18 @@ def add_jump_annotations(df: pd.DataFrame, selected_track_id: int, jump_events: 
 
     selected_mask = output["track_id"] == selected_track_id
     if jump_note:
-        output.loc[selected_mask, "notes"] = output.loc[selected_mask, "notes"].fillna("").astype(str).apply(
-            lambda value: f"{value}; {jump_note}".strip("; ")
-        )
+        output.loc[selected_mask, "notes"] = output.loc[selected_mask, "notes"].apply(lambda value: _append_note(value, jump_note))
 
     return output
+
+
+def _append_note(existing_value, new_note: str) -> str:
+    existing = "" if pd.isna(existing_value) else str(existing_value).strip()
+    if not existing:
+        return new_note
+    if new_note in existing:
+        return existing
+    return f"{existing}; {new_note}"
 
 
 def summarise_jumps(jump_events: list[dict], jump_note: str) -> dict:
@@ -241,4 +248,3 @@ def dataframe_for_csv(df: pd.DataFrame) -> pd.DataFrame:
         if column not in output:
             output[column] = np.nan
     return output[CSV_COLUMNS]
-

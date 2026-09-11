@@ -60,6 +60,9 @@ def write_annotated_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise ValueError("Input video has invalid dimensions and cannot be annotated.")
     writer, final_path = _open_writer(output_path, fps, (width, height))
 
     grouped = {int(frame): group.copy() for frame, group in tracking_df.groupby("frame_number")}
@@ -113,4 +116,3 @@ def write_annotated_video(
         writer.release()
 
     return final_path
-

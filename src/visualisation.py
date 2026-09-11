@@ -23,11 +23,14 @@ def _records_iter(frame_records) -> list[dict]:
 
 def draw_player_boxes(frame: np.ndarray, frame_records, selected_track_id: int | None = None) -> np.ndarray:
     annotated = frame.copy()
+    height, width = annotated.shape[:2]
     for record in _records_iter(frame_records):
-        x1 = int(round(record["bbox_x1"]))
-        y1 = int(round(record["bbox_y1"]))
-        x2 = int(round(record["bbox_x2"]))
-        y2 = int(round(record["bbox_y2"]))
+        x1 = max(0, min(width - 1, int(round(record["bbox_x1"]))))
+        y1 = max(0, min(height - 1, int(round(record["bbox_y1"]))))
+        x2 = max(0, min(width - 1, int(round(record["bbox_x2"]))))
+        y2 = max(0, min(height - 1, int(round(record["bbox_y2"]))))
+        if x2 <= x1 or y2 <= y1:
+            continue
         track_id = int(record["track_id"])
         is_selected = selected_track_id is not None and track_id == int(selected_track_id)
         color = (0, 140, 255) if is_selected else (40, 220, 90)
@@ -127,4 +130,3 @@ def generate_top_down_court(df: pd.DataFrame, selected_track_id: int, output_pat
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
     return output_path
-

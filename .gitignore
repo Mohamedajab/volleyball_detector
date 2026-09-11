@@ -15,4 +15,4 @@ output/*
 .vscode/
 .env
 /yolov8n-pose.pt
-
+/volleyball_detector/
