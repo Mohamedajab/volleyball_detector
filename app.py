@@ -41,7 +41,8 @@ from src.video_utils import (
     resize_for_display,
     save_uploaded_video,
 )
-from src.visualisation import draw_player_boxes, generate_team_ball_court_map, generate_top_down_court
+from src import visualisation as visualisation_module
+from src.visualisation import draw_player_boxes, generate_top_down_court
 from src.volleyball_metrics import (
     ball_records_to_dataframe,
     estimate_ball_record,
@@ -583,7 +584,11 @@ def render_output_generation(settings: dict) -> None:
     box_score_df = estimate_team_box_score(player_table, contacts_df)
 
     try:
-        top_down_path = generate_team_ball_court_map(df, ball_df, team_track_ids, OUTPUT_DIR / "team_ball_court_map.png")
+        team_map_generator = getattr(visualisation_module, "generate_team_ball_court_map", None)
+        if team_map_generator is None:
+            top_down_path = generate_top_down_court(df, selected_id, OUTPUT_DIR / "team_ball_court_map.png")
+        else:
+            top_down_path = team_map_generator(df, ball_df, team_track_ids, OUTPUT_DIR / "team_ball_court_map.png")
         selected_top_down_path = generate_top_down_court(df, selected_id, OUTPUT_DIR / "top_down_court.png")
         csv_path = write_tracking_csv(df, OUTPUT_DIR / "player_tracking.csv")
         volleyball_paths = write_volleyball_outputs(player_table, ball_df, contacts_df, box_score_df)
