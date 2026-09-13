@@ -36,7 +36,8 @@ def draw_player_boxes(frame: np.ndarray, frame_records, selected_track_id: int |
         is_team = bool(record.get("team_player", False))
         color = (0, 140, 255) if is_selected else ((255, 210, 70) if is_team else (40, 220, 90))
         thickness = 3 if is_selected or is_team else 2
-        label = f"Team ID {track_id}" if is_team else f"ID {track_id}"
+        roster_id = str(record.get("roster_id", "")).strip()
+        label = roster_id if is_team and roster_id else (f"Team ID {track_id}" if is_team else f"ID {track_id}")
         if is_selected:
             label = f"Selected Player ID: {track_id}"
 
@@ -151,8 +152,11 @@ def draw_ball_overlay(frame: np.ndarray, ball_record: dict | None, ball_trail: l
 
 def generate_team_ball_court_map(player_df: pd.DataFrame, ball_df: pd.DataFrame, team_track_ids: list[int], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    team_ids = {int(track_id) for track_id in team_track_ids}
-    team = player_df[player_df["track_id"].astype(int).isin(team_ids)].dropna(subset=["court_x_m", "court_y_m"]) if not player_df.empty else pd.DataFrame()
+    team_ids = {str(track_id) for track_id in team_track_ids}
+    if not player_df.empty and "roster_id" in player_df and player_df["roster_id"].astype(str).str.len().any():
+        team = player_df[player_df["roster_id"].astype(str).isin(team_ids)].dropna(subset=["court_x_m", "court_y_m"])
+    else:
+        team = player_df[player_df["track_id"].astype(str).isin(team_ids)].dropna(subset=["court_x_m", "court_y_m"]) if not player_df.empty else pd.DataFrame()
     ball = ball_df.dropna(subset=["court_x_m", "court_y_m"]) if ball_df is not None and not ball_df.empty else pd.DataFrame()
 
     fig, ax = plt.subplots(figsize=(5.8, 9.4))
@@ -165,8 +169,9 @@ def generate_team_ball_court_map(player_df: pd.DataFrame, ball_df: pd.DataFrame,
         ax.plot([0, COURT_WIDTH_M], [y_value, y_value], color="white", linewidth=1.5, linestyle="--")
 
     if not team.empty:
-        for track_id, group in team.groupby("track_id"):
-            ax.plot(group["court_x_m"], group["court_y_m"], linewidth=1.2, alpha=0.65, label=f"P{int(track_id)}")
+        group_column = "roster_id" if "roster_id" in team and team["roster_id"].astype(str).str.len().any() else "track_id"
+        for track_id, group in team.groupby(group_column):
+            ax.plot(group["court_x_m"], group["court_y_m"], linewidth=1.2, alpha=0.65, label=str(track_id))
             ax.scatter(group["court_x_m"].iloc[-1], group["court_y_m"].iloc[-1], s=42, edgecolor="white")
 
     if not ball.empty:

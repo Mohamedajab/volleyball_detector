@@ -68,9 +68,12 @@ def write_annotated_video(
     writer, final_path = _open_writer(output_path, fps, (width, height))
 
     if team_track_ids:
-        team_ids = {int(track_id) for track_id in team_track_ids}
+        team_ids = {str(track_id) for track_id in team_track_ids}
         tracking_df = tracking_df.copy()
-        tracking_df["team_player"] = tracking_df["track_id"].astype(int).isin(team_ids)
+        if "roster_id" in tracking_df and tracking_df["roster_id"].astype(str).str.len().any():
+            tracking_df["team_player"] = tracking_df["roster_id"].astype(str).isin(team_ids)
+        else:
+            tracking_df["team_player"] = tracking_df["track_id"].astype(str).isin(team_ids)
     grouped = {int(frame): group.copy() for frame, group in tracking_df.groupby("frame_number")}
     selected_by_frame = {
         int(row.frame_number): row

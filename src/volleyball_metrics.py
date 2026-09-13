@@ -15,6 +15,76 @@ CONTACT_RADIUS_PX = 85.0
 CONTACT_COOLDOWN_FRAMES = 8
 
 
+ROSTER_ANCHORS = {
+    "Z5": {"label": "Z5 back-left", "anchor": (COURT_WIDTH_M * 1 / 6, CENTER_LINE_Y_M * 0.32)},
+    "Z6": {"label": "Z6 back-middle", "anchor": (COURT_WIDTH_M * 3 / 6, CENTER_LINE_Y_M * 0.32)},
+    "Z1": {"label": "Z1 back-right", "anchor": (COURT_WIDTH_M * 5 / 6, CENTER_LINE_Y_M * 0.32)},
+    "Z4": {"label": "Z4 front-left", "anchor": (COURT_WIDTH_M * 1 / 6, CENTER_LINE_Y_M * 0.78)},
+    "Z3": {"label": "Z3 front-middle", "anchor": (COURT_WIDTH_M * 3 / 6, CENTER_LINE_Y_M * 0.78)},
+    "Z2": {"label": "Z2 front-right", "anchor": (COURT_WIDTH_M * 5 / 6, CENTER_LINE_Y_M * 0.78)},
+}
+ROSTER_ORDER = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"]
+
+
+def assign_near_side_roster_slots(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse noisy raw track IDs into six fixed near-side volleyball roster slots.
+
+    The raw tracker can create many short IDs when players overlap. For a back-view
+    volleyball clip, court position is more stable than raw ID, so each frame is
+    greedily assigned to the six near-side zone anchors. Raw track IDs are kept in
+    the CSV, but the user-facing identity becomes roster_id/roster_zone.
+    """
+    output = df.copy()
+    output["team_player"] = False
+    output["team_side"] = "other"
+    output["roster_id"] = ""
+    output["roster_zone"] = ""
+    output["raw_track_id"] = output["track_id"] if "track_id" in output else np.nan
+    if output.empty or "court_x_m" not in output or "court_y_m" not in output:
+        return output
+
+    for frame_number, frame_group in output.groupby("frame_number"):
+        eligible = frame_group.dropna(subset=["court_x_m", "court_y_m"])
+        eligible = eligible[
+            (eligible["court_x_m"] >= -0.75)
+            & (eligible["court_x_m"] <= COURT_WIDTH_M + 0.75)
+            & (eligible["court_y_m"] >= -0.75)
+            & (eligible["court_y_m"] <= CENTER_LINE_Y_M + 0.9)
+        ]
+        if eligible.empty:
+            continue
+
+        candidate_pairs = []
+        for row in eligible.itertuples():
+            for slot_id, slot_data in ROSTER_ANCHORS.items():
+                anchor = slot_data["anchor"]
+                distance = math.hypot(float(row.court_x_m) - anchor[0], float(row.court_y_m) - anchor[1])
+                candidate_pairs.append((distance, row.Index, slot_id, slot_data["label"]))
+
+        used_rows = set()
+        used_slots = set()
+        for distance, row_index, slot_id, slot_name in sorted(candidate_pairs, key=lambda item: item[0]):
+            if row_index in used_rows or slot_id in used_slots:
+                continue
+            used_rows.add(row_index)
+            used_slots.add(slot_id)
+            output.at[row_index, "team_player"] = True
+            output.at[row_index, "team_side"] = NEAR_SIDE_LABEL
+            output.at[row_index, "roster_id"] = slot_id
+            output.at[row_index, "roster_zone"] = slot_name
+            if len(used_slots) >= 6:
+                break
+
+    return output
+
+
+def roster_ids_from_dataframe(df: pd.DataFrame) -> list[str]:
+    if df.empty or "roster_id" not in df:
+        return []
+    found = [value for value in df["roster_id"].dropna().unique().tolist() if str(value).strip()]
+    return [slot_id for slot_id in ROSTER_ORDER if slot_id in set(map(str, found))]
+
+
 def select_near_side_team(df: pd.DataFrame, max_players: int = 6) -> list[int]:
     """Pick the camera-side team from a back-view clip using calibrated court positions."""
     if df.empty or "court_y_m" not in df:
@@ -48,12 +118,12 @@ def tag_team_players(df: pd.DataFrame, team_track_ids: list[int]) -> pd.DataFram
     return output
 
 
-def estimate_player_table(df: pd.DataFrame, team_track_ids: list[int], fps: float) -> pd.DataFrame:
+def estimate_player_table(df: pd.DataFrame, player_ids: list, fps: float, id_column: str = "track_id") -> pd.DataFrame:
     rows = []
-    for track_id in team_track_ids:
-        group = df[df["track_id"] == track_id].dropna(subset=["court_x_m", "court_y_m"]).sort_values("frame_number")
+    for player_id in player_ids:
+        group = df[df[id_column].astype(str) == str(player_id)].dropna(subset=["court_x_m", "court_y_m"]).sort_values("frame_number")
         if group.empty:
-            rows.append({"track_id": track_id, "frames": 0, "time_s": 0.0, "distance_m": 0.0, "avg_speed_mps": 0.0, "zone": "unknown"})
+            rows.append({id_column: player_id, "frames": 0, "time_s": 0.0, "distance_m": 0.0, "avg_speed_mps": 0.0, "zone": "unknown"})
             continue
 
         distance = 0.0
@@ -77,16 +147,24 @@ def estimate_player_table(df: pd.DataFrame, team_track_ids: list[int], fps: floa
         else:
             column = "middle"
         time_s = len(group) / max(fps, 1.0)
+        roster_zone = ""
+        if "roster_zone" in group and group["roster_zone"].astype(str).str.len().any():
+            roster_zone = group["roster_zone"].mode().iloc[0]
+        raw_ids = ""
+        if "raw_track_id" in group:
+            raw_ids = ",".join(str(int(value)) for value in sorted(group["raw_track_id"].dropna().astype(int).unique())[:12])
         rows.append(
             {
-                "track_id": int(track_id),
+                id_column: player_id,
+                "display_id": str(player_id),
+                "raw_track_ids_seen": raw_ids,
                 "frames": int(len(group)),
                 "time_s": round(time_s, 2),
                 "distance_m": round(distance, 2),
                 "avg_speed_mps": round(distance / time_s, 2) if time_s > 0 else 0.0,
                 "avg_court_x_m": round(float(group["court_x_m"].mean()), 2),
                 "avg_court_y_m": round(float(group["court_y_m"].mean()), 2),
-                "zone": f"{row_zone} {column}",
+                "zone": roster_zone or f"{row_zone} {column}",
             }
         )
     return pd.DataFrame(rows)
@@ -141,11 +219,12 @@ def estimate_ball_record(ball_detection, frame_number: int, timestamp_seconds: f
     }
 
 
-def estimate_contacts(player_df: pd.DataFrame, ball_df: pd.DataFrame, team_track_ids: list[int], fps: float) -> pd.DataFrame:
+def estimate_contacts(player_df: pd.DataFrame, ball_df: pd.DataFrame, player_ids: list, fps: float) -> pd.DataFrame:
     columns = [
         "frame_number",
         "timestamp_seconds",
-        "track_id",
+        "player_id",
+        "raw_track_id",
         "action_guess",
         "court_x_m",
         "court_y_m",
@@ -154,10 +233,12 @@ def estimate_contacts(player_df: pd.DataFrame, ball_df: pd.DataFrame, team_track
         "contact_height_estimate_m",
         "confidence_note",
     ]
-    if player_df.empty or ball_df.empty or not team_track_ids:
+    if player_df.empty or ball_df.empty or not player_ids:
         return pd.DataFrame(columns=columns)
 
-    team = player_df[player_df["track_id"].astype(int).isin({int(track_id) for track_id in team_track_ids})].copy()
+    id_column = "roster_id" if "roster_id" in player_df and any(str(value).strip() for value in player_df["roster_id"].dropna().unique()) else "track_id"
+    wanted_ids = {str(player_id) for player_id in player_ids}
+    team = player_df[player_df[id_column].astype(str).isin(wanted_ids)].copy()
     if team.empty:
         return pd.DataFrame(columns=columns)
 
@@ -203,7 +284,8 @@ def estimate_contacts(player_df: pd.DataFrame, ball_df: pd.DataFrame, team_track
             {
                 "frame_number": frame_number,
                 "timestamp_seconds": float(ball.timestamp_seconds),
-                "track_id": int(player.track_id),
+                "player_id": str(getattr(player, id_column)),
+                "raw_track_id": int(player.raw_track_id) if hasattr(player, "raw_track_id") and pd.notna(player.raw_track_id) else int(player.track_id),
                 "action_guess": action,
                 "court_x_m": float(player.court_x_m) if pd.notna(player.court_x_m) else np.nan,
                 "court_y_m": float(player.court_y_m) if pd.notna(player.court_y_m) else np.nan,
@@ -222,14 +304,15 @@ def estimate_contacts(player_df: pd.DataFrame, ball_df: pd.DataFrame, team_track
 def estimate_team_box_score(player_table: pd.DataFrame, contacts_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for row in player_table.itertuples(index=False):
-        player_contacts = contacts_df[contacts_df["track_id"] == int(row.track_id)] if not contacts_df.empty else pd.DataFrame()
+        row_id = str(getattr(row, "display_id", getattr(row, "roster_id", getattr(row, "track_id", ""))))
+        player_contacts = contacts_df[contacts_df["player_id"].astype(str) == row_id] if not contacts_df.empty and "player_id" in contacts_df else pd.DataFrame()
         attacks = int(player_contacts["action_guess"].str.contains("attack", na=False).sum()) if not player_contacts.empty else 0
         sets = int(player_contacts["action_guess"].str.contains("set", na=False).sum()) if not player_contacts.empty else 0
         receptions = int(player_contacts["action_guess"].str.contains("dig|reception|pass", na=False, regex=True).sum()) if not player_contacts.empty else 0
         max_height = player_contacts["contact_height_estimate_m"].max() if not player_contacts.empty else np.nan
         rows.append(
             {
-                "track_id": int(row.track_id),
+                "player_id": row_id,
                 "zone": row.zone,
                 "tracked_time_s": row.time_s,
                 "movement_m": row.distance_m,

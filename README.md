@@ -15,7 +15,7 @@ The project is inspired by professional sports analytics platforms such as Ballt
 - YOLOv8 player detection with configurable confidence threshold
 - Back-view near-side team mode for the six players facing the net away from camera
 - ByteTrack player tracking by default, with BoT-SORT and centroid fallback options
-- Player ID preview still available, defaulting to the longest-lived track
+- Six-slot roster preview that collapses noisy raw tracklets into Z1-Z6 court roles
 - Optional ball tracking with a general YOLO fallback, best used with volleyball-trained ball weights
 - Heuristic ball-contact and contact-height estimates
 - Team box-score style CSVs for movement, contacts, attack-touch guesses, set-touch guesses, and reception/pass-touch guesses
@@ -33,7 +33,7 @@ The project is inspired by professional sports analytics platforms such as Ballt
    near left, near right, far right, far left.
 5. Confirm the court overlay preview.
 6. Run a short detection/tracking preview.
-7. Select the player track ID to analyse.
+7. Review the Z1-Z6 near-side roster preview and optionally choose one raw track for an individual video trail.
 8. Process the full video.
 9. Download:
    `output/annotated_video.mp4`, `output/player_tracking.csv`, and `output/top_down_court.png`.
@@ -62,6 +62,7 @@ src/
   calibration.py     Homography, court mapping, court line overlay
   analysis.py        Movement metrics and approximate jump detection
   visualisation.py   Bounding boxes, trails, overlays, top-down map
+  ball_tracking.py    Classical moving bright-object ball fallback
   export_utils.py    CSV and annotated video export
 ```
 
@@ -98,7 +99,7 @@ For jump signal estimation, the optional pose model is loaded from `models/yolov
 
 ### Player Tracking
 
-The app is now designed first for a centred back-view clip filmed from behind your team. After calibration, it filters tracked players to the camera-side half of the court and chooses up to six longest-lived tracks as the near-side team. It uses Ultralytics tracking by default with `bytetrack.yaml`; `botsort.yaml` is available from the sidebar for clips with heavier overlap or occlusion. A centroid tracker remains as a fallback if the YOLO tracker dependency path fails on a machine.
+The app is now designed first for a centred back-view clip filmed from behind your team. After calibration, it maps detections to court metres and greedily assigns visible near-side players into six fixed volleyball court zones: Z1, Z2, Z3, Z4, Z5, and Z6. It uses Ultralytics tracking by default with `bytetrack.yaml`; `botsort.yaml` is available from the sidebar for clips with heavier overlap or occlusion. A centroid tracker remains as a fallback if the YOLO tracker dependency path fails on a machine.
 
 ### Movement and Jump Analysis
 
@@ -167,9 +168,9 @@ detection_confidence, jump_height_estimate_m, notes
 
 ## Future Improvements
 
-- Integrate ByteTrack or BoT-SORT when tracker dependencies/configs are available
+- Train or add volleyball-specific ball and jersey-number detection weights
 - Add automatic court line detection as an optional helper
-- Improve player re-identification after occlusion
+- Improve player re-identification after occlusion with jersey-number OCR and appearance embeddings
 - Add team/side segmentation
 - Add richer event detection for jumps, attacks, serves, and blocks
 - Add a small sample video and screenshots for the GitHub demo

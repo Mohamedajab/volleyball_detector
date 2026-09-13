@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+from src.ball_tracking import detect_ball_candidates_classical
 from src.analysis import (
     add_jump_annotations,
     calculate_movement_metrics,
@@ -49,6 +50,8 @@ from src.volleyball_metrics import (
     estimate_contacts,
     estimate_player_table,
     estimate_team_box_score,
+    assign_near_side_roster_slots,
+    roster_ids_from_dataframe,
     select_near_side_team,
     tag_team_players,
     write_volleyball_outputs,
@@ -131,8 +134,6 @@ def reset_for_new_video(video_path: Path, signature: str) -> None:
 
 
 def run_ball_tracking_pass(video_path: str, ball_model, pixel_to_court_matrix, fps: float, frame_limit: int | None, progress_callback=None):
-    if ball_model is None:
-        return []
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return []
@@ -140,6 +141,7 @@ def run_ball_tracking_pass(video_path: str, ball_model, pixel_to_court_matrix, f
     frames_to_process = min(total_frames, frame_limit) if frame_limit else total_frames
     records = []
     frame_number = 0
+    previous_frame = None
     try:
         while True:
             if frame_limit is not None and frame_number >= frame_limit:
@@ -149,9 +151,12 @@ def run_ball_tracking_pass(video_path: str, ball_model, pixel_to_court_matrix, f
                 break
             timestamp = frame_number / fps if fps > 0 else 0.0
             detector = getattr(detection_module, "detect_balls", None)
-            balls = detector(ball_model, frame, confidence_threshold=0.12) if detector is not None else []
+            yolo_balls = detector(ball_model, frame, confidence_threshold=0.12) if detector is not None and ball_model is not None else []
+            classical_balls = detect_ball_candidates_classical(frame, previous_frame)
+            balls = sorted([*yolo_balls, *classical_balls], key=lambda item: item.confidence, reverse=True)
             if balls:
                 records.append(estimate_ball_record(balls[0], frame_number, timestamp, pixel_to_court_matrix))
+            previous_frame = frame.copy()
             frame_number += 1
             if progress_callback and frames_to_process:
                 progress_callback(min(frame_number / frames_to_process, 1.0), f"Tracking ball frame {frame_number} of {frames_to_process}")
@@ -450,39 +455,58 @@ def render_tracking_preview(settings: dict) -> None:
 
         track_counts = df.groupby("track_id").size().sort_values(ascending=False)
         track_ids = [int(track_id) for track_id in track_counts.index.tolist()]
+        roster_preview = assign_near_side_roster_slots(df)
+        roster_ids = roster_ids_from_dataframe(roster_preview)
         st.session_state.preview_records = records
         st.session_state.preview_track_ids = track_ids
         st.session_state.selected_track_id = track_ids[0] if track_ids else None
         st.session_state.preview_frame_number = int(df.groupby("frame_number").size().sort_values(ascending=False).index[0])
-        st.success(f"Detected {len(track_ids)} track ID(s) in the preview. Defaulted to the longest-lived track.")
+        st.success(
+            f"Roster preview built {len(roster_ids)} near-side slot(s): "
+            f"{', '.join(roster_ids) if roster_ids else 'none found yet'}. "
+            f"Raw tracker produced {len(track_ids)} temporary ID(s), kept only as debug data."
+        )
         st.rerun()
 
     if st.session_state.preview_records:
         df = records_to_dataframe(st.session_state.preview_records)
+        roster_preview = assign_near_side_roster_slots(df)
+        roster_ids = roster_ids_from_dataframe(roster_preview)
+        st.success(f"Roster preview: {len(roster_ids)} near-side volleyball slot(s) found: {', '.join(roster_ids) if roster_ids else 'none'}")
         preview_frame_number = st.session_state.preview_frame_number or int(df["frame_number"].max())
         frame = cached_extract_frame(st.session_state.video_path, preview_frame_number)
         if frame is not None:
-            frame_records = df[df["frame_number"] == preview_frame_number]
+            frame_records = roster_preview[roster_preview["frame_number"] == preview_frame_number]
             preview = draw_court_lines(frame, st.session_state.court_to_pixel_matrix)
             preview = draw_player_boxes(preview, frame_records, selected_track_id=st.session_state.selected_track_id)
-            st.image(bgr_to_rgb(preview), caption=f"Preview frame {preview_frame_number} with track IDs", use_container_width=True)
+            st.image(bgr_to_rgb(preview), caption=f"Preview frame {preview_frame_number}: near-side roster slots", use_container_width=True)
 
-        counts = df.groupby("track_id").size().reset_index(name="preview_frames_detected")
-        counts = counts.sort_values("preview_frames_detected", ascending=False)
-        st.dataframe(counts, use_container_width=True, hide_index=True)
+        roster_counts = roster_preview[roster_preview["team_player"]].groupby(["roster_id", "roster_zone"]).size().reset_index(name="frames_detected")
+        if not roster_counts.empty:
+            st.dataframe(roster_counts.sort_values("roster_id"), use_container_width=True, hide_index=True)
+
+        with st.expander("Raw YOLO tracklets / debug"):
+            counts = df.groupby("track_id").size().reset_index(name="preview_frames_detected")
+            counts = counts.sort_values("preview_frames_detected", ascending=False)
+            st.dataframe(counts, use_container_width=True, hide_index=True)
 
 
 def render_player_selection() -> None:
-    st.subheader("Step 5: Confirm Analysis Track")
+    st.subheader("Step 5: Optional Selected Player Overlay")
     track_ids = st.session_state.preview_track_ids
     if not track_ids:
-        st.info("Run the tracking preview to populate player IDs. The full output will focus on the near-side team of up to six players.")
+        st.info("Run the tracking preview first. The full report will focus on the six near-side volleyball slots, not every temporary raw tracker ID.")
         return
 
     current = st.session_state.selected_track_id if st.session_state.selected_track_id in track_ids else track_ids[0]
-    selected = st.selectbox("Player track ID", options=track_ids, index=track_ids.index(current))
+    selected = st.selectbox(
+        "Optional raw track ID for one highlighted trail",
+        options=track_ids,
+        index=track_ids.index(current),
+        help="The main analytics use Z1-Z6 team slots. This only chooses one raw YOLO track to highlight in the video overlay.",
+    )
     st.session_state.selected_track_id = int(selected)
-    st.success(f"Selected Player ID: {selected}")
+    st.success(f"Optional highlight track: {selected}. Team metrics will still use Z1-Z6.")
 
 
 def render_output_generation(settings: dict) -> None:
@@ -548,11 +572,12 @@ def render_output_generation(settings: dict) -> None:
     df = add_jump_annotations(df, selected_id, jump_events, jump_note)
     jump_summary = summarise_jumps(jump_events, jump_note)
 
+    df = assign_near_side_roster_slots(df)
+    roster_ids = roster_ids_from_dataframe(df)
     team_track_ids = select_near_side_team(df, max_players=6)
-    if len(team_track_ids) < 6:
-        st.warning(f"Detected {len(team_track_ids)} likely near-side team player(s). For best results use a centred back-view clip where all six players are visible.")
-    df = tag_team_players(df, team_track_ids)
-    player_table = estimate_player_table(df, team_track_ids, metadata["fps"])
+    if len(roster_ids) < 6:
+        st.warning(f"Built {len(roster_ids)} near-side roster slot(s). For best results use a centred back-view clip where all six players are visible.")
+    player_table = estimate_player_table(df, roster_ids, metadata["fps"], id_column="roster_id")
 
     ball_model = None
     ball_source = None
@@ -563,7 +588,7 @@ def render_output_generation(settings: dict) -> None:
     if ball_model is not None:
         st.caption(f"Ball model: {ball_source}")
     else:
-        st.info("Ball model unavailable. Team movement stats will still be generated, but ball trajectory/contact outputs will be empty.")
+        st.info("YOLO ball model unavailable. Using a classical moving bright-object ball fallback instead.")
 
     ball_progress = st.progress(0, text="Tracking ball...")
 
@@ -580,7 +605,7 @@ def render_output_generation(settings: dict) -> None:
     )
     ball_progress.empty()
     ball_df = ball_records_to_dataframe(ball_records)
-    contacts_df = estimate_contacts(df, ball_df, team_track_ids, metadata["fps"])
+    contacts_df = estimate_contacts(df, ball_df, roster_ids, metadata["fps"])
     box_score_df = estimate_team_box_score(player_table, contacts_df)
 
     try:
@@ -588,7 +613,7 @@ def render_output_generation(settings: dict) -> None:
         if team_map_generator is None:
             top_down_path = generate_top_down_court(df, selected_id, OUTPUT_DIR / "team_ball_court_map.png")
         else:
-            top_down_path = team_map_generator(df, ball_df, team_track_ids, OUTPUT_DIR / "team_ball_court_map.png")
+            top_down_path = team_map_generator(df, ball_df, roster_ids, OUTPUT_DIR / "team_ball_court_map.png")
         selected_top_down_path = generate_top_down_court(df, selected_id, OUTPUT_DIR / "top_down_court.png")
         csv_path = write_tracking_csv(df, OUTPUT_DIR / "player_tracking.csv")
         volleyball_paths = write_volleyball_outputs(player_table, ball_df, contacts_df, box_score_df)
@@ -612,7 +637,7 @@ def render_output_generation(settings: dict) -> None:
             output_path=OUTPUT_DIR / "annotated_video.mp4",
             progress_callback=video_update,
             ball_df=ball_df,
-            team_track_ids=team_track_ids,
+            team_track_ids=roster_ids,
         )
     except Exception as exc:
         video_progress.empty()
@@ -625,7 +650,7 @@ def render_output_generation(settings: dict) -> None:
         "movement_metrics": movement_metrics,
         "jump_summary": jump_summary,
         "jump_events": jump_events,
-        "team_track_ids": team_track_ids,
+        "team_track_ids": roster_ids,
         "player_table": player_table,
         "ball_df": ball_df,
         "contacts_df": contacts_df,
@@ -669,14 +694,14 @@ def render_results() -> None:
     box_score_df = results.get("box_score_df")
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Near-side players", len(team_ids))
+    col1.metric("Roster slots", len(team_ids))
     col2.metric("Ball detections", 0 if ball_df is None else len(ball_df))
     col3.metric("Contact guesses", 0 if contacts_df is None else len(contacts_df))
     col4.metric("Selected distance", f"{metrics.get('total_distance_m', 0):.2f} m")
     max_jump = jumps.get("max_jump_height_m")
     col5.metric("Selected max jump", "N/A" if max_jump is None else f"{max_jump:.2f} m")
 
-    st.caption("Near-side team mode assumes a centred back-view recording from behind your team. Ball/contact stats are heuristic unless you provide a volleyball-trained ball model.")
+    st.caption("Back-view roster mode: raw tracker IDs are collapsed into six court-role slots Z1-Z6. Ball/contact stats are heuristic unless you provide a volleyball-trained ball model.")
     st.caption(metrics.get("note", ""))
     st.caption(jumps.get("note", ""))
 
@@ -731,8 +756,14 @@ def main() -> None:
     ensure_workspace_directories()
     initialise_state()
 
-    st.title(APP_TITLE)
-    st.write(APP_DESCRIPTION)
+    st.title("AI Volleyball Back-View Team Analyzer")
+    st.markdown("### Six-player near-side roster tracking, court calibration, ball trajectory, contact-height estimates, and volleyball-style stat sheets.")
+    st.info("Built for a camera behind your team. Raw YOLO tracklets are collapsed into fixed volleyball zones Z1-Z6, so the report follows the six near-side players instead of dozens of temporary IDs.")
+    mode_cols = st.columns(4)
+    mode_cols[0].metric("Primary mode", "Back-view")
+    mode_cols[1].metric("Team focus", "6 slots")
+    mode_cols[2].metric("Identity layer", "Z1-Z6")
+    mode_cols[3].metric("Ball path", "YOLO + CV")
 
     settings = render_sidebar()
 
