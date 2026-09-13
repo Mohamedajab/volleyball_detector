@@ -23,8 +23,10 @@ from src.config import (
     DEFAULT_MAX_MISSING_FRAMES,
     DEFAULT_MAX_TRACK_DISTANCE_PX,
     DEFAULT_PREVIEW_SECONDS,
+    DEFAULT_TRACKER_BACKEND,
     OUTPUT_DIR,
     SUPPORTED_VIDEO_TYPES,
+    TRACKER_BACKENDS,
 )
 from src.detection import load_detection_model, load_pose_model
 from src.export_utils import write_annotated_video, write_tracking_csv
@@ -121,8 +123,14 @@ def render_sidebar() -> dict:
     st.sidebar.divider()
     st.sidebar.header("Settings")
     confidence = st.sidebar.slider("Detection confidence", 0.10, 0.90, DEFAULT_CONFIDENCE_THRESHOLD, 0.05)
-    max_distance = st.sidebar.slider("Tracker match distance (px)", 30.0, 220.0, DEFAULT_MAX_TRACK_DISTANCE_PX, 5.0)
-    max_missing = st.sidebar.slider("Keep lost track for frames", 1, 60, DEFAULT_MAX_MISSING_FRAMES, 1)
+    tracker_backend = st.sidebar.selectbox(
+        "Tracking backend",
+        options=list(TRACKER_BACKENDS),
+        index=list(TRACKER_BACKENDS).index(DEFAULT_TRACKER_BACKEND),
+        help="ByteTrack is the default. Try BoT-SORT when player IDs swap during overlaps. Use centroid fallback only if YOLO tracking fails.",
+    )
+    max_distance = st.sidebar.slider("Fallback tracker match distance (px)", 30.0, 220.0, DEFAULT_MAX_TRACK_DISTANCE_PX, 5.0)
+    max_missing = st.sidebar.slider("Fallback keep-lost frames", 1, 60, DEFAULT_MAX_MISSING_FRAMES, 1)
     preview_seconds = st.sidebar.slider("Preview duration (seconds)", 1.0, 15.0, DEFAULT_PREVIEW_SECONDS, 1.0)
     full_frame_limit = st.sidebar.number_input(
         "Full processing frame limit (0 = full video)",
@@ -136,6 +144,7 @@ def render_sidebar() -> dict:
 
     return {
         "confidence": float(confidence),
+        "tracker_backend": str(tracker_backend),
         "max_distance": float(max_distance),
         "max_missing": int(max_missing),
         "preview_seconds": float(preview_seconds),
@@ -370,6 +379,7 @@ def render_tracking_preview(settings: dict) -> None:
                 max_missing_frames=settings["max_missing"],
                 frame_limit=frame_limit,
                 progress_callback=update_progress,
+                tracker_backend=settings["tracker_backend"],
             )
         except Exception as exc:
             progress.empty()
@@ -384,12 +394,13 @@ def render_tracking_preview(settings: dict) -> None:
             st.error("No players detected in the preview. Try a lower confidence threshold or a clearer video.")
             return
 
-        track_ids = sorted(int(track_id) for track_id in df["track_id"].dropna().unique())
+        track_counts = df.groupby("track_id").size().sort_values(ascending=False)
+        track_ids = [int(track_id) for track_id in track_counts.index.tolist()]
         st.session_state.preview_records = records
         st.session_state.preview_track_ids = track_ids
         st.session_state.selected_track_id = track_ids[0] if track_ids else None
         st.session_state.preview_frame_number = int(df.groupby("frame_number").size().sort_values(ascending=False).index[0])
-        st.success(f"Detected {len(track_ids)} track ID(s) in the preview.")
+        st.success(f"Detected {len(track_ids)} track ID(s) in the preview. Defaulted to the longest-lived track.")
         st.rerun()
 
     if st.session_state.preview_records:
@@ -403,6 +414,7 @@ def render_tracking_preview(settings: dict) -> None:
             st.image(bgr_to_rgb(preview), caption=f"Preview frame {preview_frame_number} with track IDs", use_container_width=True)
 
         counts = df.groupby("track_id").size().reset_index(name="preview_frames_detected")
+        counts = counts.sort_values("preview_frames_detected", ascending=False)
         st.dataframe(counts, use_container_width=True, hide_index=True)
 
 
@@ -461,6 +473,7 @@ def render_output_generation(settings: dict) -> None:
             progress_callback=tracking_update,
             pose_model=pose_model,
             selected_track_id=selected_id,
+            tracker_backend=settings["tracker_backend"],
         )
     except Exception as exc:
         tracking_progress.empty()

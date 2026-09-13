@@ -7,4 +7,4 @@ ultralytics>=8.0
 scipy>=1.10
 matplotlib>=3.7
 streamlit-image-coordinates>=0.1.6
-
+lap>=0.5.12

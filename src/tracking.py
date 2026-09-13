@@ -127,6 +127,51 @@ class CentroidTracker:
         return sorted(observations, key=lambda observation: observation.track_id)
 
 
+def _names_to_dict(names) -> dict[int, str]:
+    if isinstance(names, dict):
+        return {int(key): str(value) for key, value in names.items()}
+    if isinstance(names, (list, tuple)):
+        return {index: str(value) for index, value in enumerate(names)}
+    return {}
+
+
+def _is_player_class(class_name: str, names: dict[int, str]) -> bool:
+    lowered = class_name.lower()
+    known_player_labels = ("person", "player", "athlete")
+    has_known_player_label = any(any(token in value.lower() for token in known_player_labels) for value in names.values())
+    return not has_known_player_label or any(token in lowered for token in known_player_labels)
+
+
+def _observations_from_tracked_result(result, model, frame_number: int, timestamp_seconds: float) -> list[TrackObservation]:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0 or getattr(boxes, "id", None) is None:
+        return []
+
+    names = _names_to_dict(getattr(result, "names", None) or getattr(model, "names", None))
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    confidences = boxes.conf.detach().cpu().numpy()
+    classes = boxes.cls.detach().cpu().numpy() if boxes.cls is not None else np.full(len(xyxy), -1)
+    track_ids = boxes.id.detach().cpu().numpy()
+
+    observations: list[TrackObservation] = []
+    for bbox, confidence, class_id, track_id in zip(xyxy, confidences, classes, track_ids):
+        class_id_int = int(class_id) if class_id >= 0 else None
+        class_name = names.get(class_id_int, "player")
+        if not _is_player_class(class_name, names):
+            continue
+        observations.append(
+            TrackObservation(
+                frame_number=frame_number,
+                timestamp_seconds=timestamp_seconds,
+                track_id=int(track_id),
+                bbox=tuple(float(value) for value in bbox),
+                confidence=float(confidence),
+                class_name=class_name,
+            )
+        )
+    return sorted(observations, key=lambda observation: observation.track_id)
+
+
 def _court_note(court_x: float | None, court_y: float | None) -> str:
     if court_x is None or court_y is None:
         return "court mapping unavailable"
@@ -195,6 +240,7 @@ def run_tracking_on_video(
     progress_callback: Callable[[float, str], None] | None = None,
     pose_model=None,
     selected_track_id: int | None = None,
+    tracker_backend: str = "bytetrack.yaml",
 ) -> list[dict]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -205,9 +251,11 @@ def run_tracking_on_video(
     frames_to_process = min(total_frames, frame_limit) if frame_limit else total_frames
     frames_to_process = max(frames_to_process, 0)
 
+    use_yolo_tracker = tracker_backend != "centroid fallback"
     tracker = CentroidTracker(max_distance_px=max_distance_px, max_missing_frames=max_missing_frames)
     records: list[dict] = []
     frame_number = 0
+    yolo_tracker_failed = False
 
     try:
         while True:
@@ -218,9 +266,26 @@ def run_tracking_on_video(
             if not ok:
                 break
 
-            detections = detect_players(detector_model, frame, confidence_threshold=confidence_threshold)
             timestamp = frame_number / fps if fps > 0 else frame_number / DEFAULT_FPS
-            observations = tracker.update(detections, frame_number, timestamp)
+            observations: list[TrackObservation] = []
+            if use_yolo_tracker and not yolo_tracker_failed:
+                try:
+                    results = detector_model.track(
+                        frame,
+                        persist=frame_number > 0,
+                        tracker=tracker_backend,
+                        conf=confidence_threshold,
+                        verbose=False,
+                    )
+                    observations = _observations_from_tracked_result(results[0], detector_model, frame_number, timestamp) if results else []
+                except Exception:
+                    yolo_tracker_failed = True
+                    observations = []
+
+            if not use_yolo_tracker or yolo_tracker_failed:
+                detections = detect_players(detector_model, frame, confidence_threshold=confidence_threshold)
+                observations = tracker.update(detections, frame_number, timestamp)
+
             for observation in observations:
                 records.append(
                     observation_to_record(
@@ -234,9 +299,10 @@ def run_tracking_on_video(
 
             frame_number += 1
             if progress_callback and frames_to_process > 0:
+                backend_label = "centroid fallback" if yolo_tracker_failed or not use_yolo_tracker else tracker_backend
                 progress_callback(
                     min(frame_number / frames_to_process, 1.0),
-                    f"Tracking frame {frame_number} of {frames_to_process}",
+                    f"Tracking frame {frame_number} of {frames_to_process} ({backend_label})",
                 )
     finally:
         cap.release()

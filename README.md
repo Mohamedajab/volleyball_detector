@@ -13,8 +13,8 @@ The project is inspired by professional sports analytics platforms such as Ballt
 - Homography mapping from camera pixels to real-world court coordinates in metres
 - Volleyball court line overlay on the calibration preview and output video
 - YOLOv8 player detection with configurable confidence threshold
-- Centroid-based player tracking fallback that works without external tracker configs
-- Player ID selection after a short preview pass
+- ByteTrack player tracking by default, with BoT-SORT and centroid fallback options
+- Player ID selection after a short preview pass, defaulting to the longest-lived track
 - Selected-player movement trail and stats overlay in the exported video
 - Top-down court movement map
 - Movement distance, average speed, tracked time, and approximate jump estimates
@@ -94,7 +94,7 @@ For jump signal estimation, the optional pose model is loaded from `models/yolov
 
 ### Player Tracking
 
-The current MVP uses a centroid tracker that matches detections frame-to-frame by nearest bottom-centre point. It keeps tracks alive briefly when detections disappear and removes stale tracks after a configurable number of missing frames.
+The app now uses Ultralytics tracking by default with `bytetrack.yaml`, which is a stronger baseline for keeping persistent player IDs than matching fresh detections manually. `botsort.yaml` is available from the sidebar for clips with heavier overlap or occlusion. A centroid tracker remains as a fallback if the YOLO tracker dependency path fails on a machine.
 
 ### Movement and Jump Analysis
 
@@ -150,7 +150,7 @@ detection_confidence, jump_height_estimate_m, notes
 - Court calibration depends on the user selecting accurate court corners.
 - Homography maps ground-plane positions only; it does not solve full 3D player motion.
 - Jump height estimates are approximate and depend on camera angle, detection quality, pose quality, and calibration quality.
-- The centroid tracker can switch IDs when players overlap heavily or move very quickly.
+- ByteTrack/BoT-SORT can still switch IDs when players overlap heavily, leave frame, or are poorly detected.
 - YOLO detection quality depends on the model weights available in `models/`.
 - The app is designed as a working MVP for portfolio demonstration, not a certified sports science tool.
 
