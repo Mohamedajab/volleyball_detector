@@ -28,7 +28,7 @@ from src.config import (
     SUPPORTED_VIDEO_TYPES,
     TRACKER_BACKENDS,
 )
-from src.detection import load_detection_model, load_pose_model
+from src.detection import detect_balls, load_ball_model, load_detection_model, load_pose_model
 from src.export_utils import write_annotated_video, write_tracking_csv
 from src.tracking import run_tracking_on_video
 from src.video_utils import (
@@ -40,7 +40,17 @@ from src.video_utils import (
     resize_for_display,
     save_uploaded_video,
 )
-from src.visualisation import draw_player_boxes, generate_top_down_court
+from src.visualisation import draw_player_boxes, generate_team_ball_court_map, generate_top_down_court
+from src.volleyball_metrics import (
+    ball_records_to_dataframe,
+    estimate_ball_record,
+    estimate_contacts,
+    estimate_player_table,
+    estimate_team_box_score,
+    select_near_side_team,
+    tag_team_players,
+    write_volleyball_outputs,
+)
 
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
@@ -78,6 +88,13 @@ def cached_pose_model():
     return load_pose_model()
 
 
+
+
+@st.cache_resource(show_spinner=False)
+def cached_ball_model():
+    return load_ball_model()
+
+
 @st.cache_data(show_spinner=False)
 def cached_extract_frame(video_path: str, frame_number: int):
     return extract_frame(video_path, frame_number)
@@ -106,6 +123,37 @@ def reset_for_new_video(video_path: Path, signature: str) -> None:
     cached_extract_frame.clear()
 
 
+
+
+def run_ball_tracking_pass(video_path: str, ball_model, pixel_to_court_matrix, fps: float, frame_limit: int | None, progress_callback=None):
+    if ball_model is None:
+        return []
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return []
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frames_to_process = min(total_frames, frame_limit) if frame_limit else total_frames
+    records = []
+    frame_number = 0
+    try:
+        while True:
+            if frame_limit is not None and frame_number >= frame_limit:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            timestamp = frame_number / fps if fps > 0 else 0.0
+            balls = detect_balls(ball_model, frame, confidence_threshold=0.12)
+            if balls:
+                records.append(estimate_ball_record(balls[0], frame_number, timestamp, pixel_to_court_matrix))
+            frame_number += 1
+            if progress_callback and frames_to_process:
+                progress_callback(min(frame_number / frames_to_process, 1.0), f"Tracking ball frame {frame_number} of {frames_to_process}")
+    finally:
+        cap.release()
+    return records
+
+
 def render_sidebar() -> dict:
     st.sidebar.header("Workflow")
     steps = [
@@ -113,7 +161,7 @@ def render_sidebar() -> dict:
         ("Step 2", "Select calibration frame", st.session_state.video_path is not None),
         ("Step 3", "Mark court corners", st.session_state.pixel_to_court_matrix is not None),
         ("Step 4", "Run detection/tracking", bool(st.session_state.preview_track_ids)),
-        ("Step 5", "Select player", st.session_state.selected_track_id is not None),
+        ("Step 5", "Confirm analysis track", st.session_state.selected_track_id is not None),
         ("Step 6", "Generate outputs", st.session_state.results is not None),
         ("Step 7", "Download results", st.session_state.results is not None),
     ]
@@ -419,10 +467,10 @@ def render_tracking_preview(settings: dict) -> None:
 
 
 def render_player_selection() -> None:
-    st.subheader("Step 5: Select Player")
+    st.subheader("Step 5: Confirm Analysis Track")
     track_ids = st.session_state.preview_track_ids
     if not track_ids:
-        st.info("Run the tracking preview to populate player IDs.")
+        st.info("Run the tracking preview to populate player IDs. The full output will focus on the near-side team of up to six players.")
         return
 
     current = st.session_state.selected_track_id if st.session_state.selected_track_id in track_ids else track_ids[0]
@@ -494,11 +542,48 @@ def render_output_generation(settings: dict) -> None:
     df = add_jump_annotations(df, selected_id, jump_events, jump_note)
     jump_summary = summarise_jumps(jump_events, jump_note)
 
+    team_track_ids = select_near_side_team(df, max_players=6)
+    if len(team_track_ids) < 6:
+        st.warning(f"Detected {len(team_track_ids)} likely near-side team player(s). For best results use a centred back-view clip where all six players are visible.")
+    df = tag_team_players(df, team_track_ids)
+    player_table = estimate_player_table(df, team_track_ids, metadata["fps"])
+
+    ball_model = None
+    ball_source = None
     try:
-        top_down_path = generate_top_down_court(df, selected_id, OUTPUT_DIR / "top_down_court.png")
+        ball_model, ball_source = cached_ball_model()
+    except Exception:
+        ball_model = None
+    if ball_model is not None:
+        st.caption(f"Ball model: {ball_source}")
+    else:
+        st.info("Ball model unavailable. Team movement stats will still be generated, but ball trajectory/contact outputs will be empty.")
+
+    ball_progress = st.progress(0, text="Tracking ball...")
+
+    def ball_update(value: float, text: str) -> None:
+        ball_progress.progress(value, text=text)
+
+    ball_records = run_ball_tracking_pass(
+        st.session_state.video_path,
+        ball_model,
+        st.session_state.pixel_to_court_matrix,
+        metadata["fps"],
+        settings["full_frame_limit"],
+        progress_callback=ball_update,
+    )
+    ball_progress.empty()
+    ball_df = ball_records_to_dataframe(ball_records)
+    contacts_df = estimate_contacts(df, ball_df, team_track_ids, metadata["fps"])
+    box_score_df = estimate_team_box_score(player_table, contacts_df)
+
+    try:
+        top_down_path = generate_team_ball_court_map(df, ball_df, team_track_ids, OUTPUT_DIR / "team_ball_court_map.png")
+        selected_top_down_path = generate_top_down_court(df, selected_id, OUTPUT_DIR / "top_down_court.png")
         csv_path = write_tracking_csv(df, OUTPUT_DIR / "player_tracking.csv")
+        volleyball_paths = write_volleyball_outputs(player_table, ball_df, contacts_df, box_score_df)
     except Exception as exc:
-        st.error(f"Could not create CSV or top-down court output: {exc}")
+        st.error(f"Could not create CSV or court-map outputs: {exc}")
         return
 
     video_progress = st.progress(0, text="Writing annotated video...")
@@ -516,6 +601,8 @@ def render_output_generation(settings: dict) -> None:
             jump_events=jump_events,
             output_path=OUTPUT_DIR / "annotated_video.mp4",
             progress_callback=video_update,
+            ball_df=ball_df,
+            team_track_ids=team_track_ids,
         )
     except Exception as exc:
         video_progress.empty()
@@ -528,16 +615,26 @@ def render_output_generation(settings: dict) -> None:
         "movement_metrics": movement_metrics,
         "jump_summary": jump_summary,
         "jump_events": jump_events,
+        "team_track_ids": team_track_ids,
+        "player_table": player_table,
+        "ball_df": ball_df,
+        "contacts_df": contacts_df,
+        "box_score_df": box_score_df,
         "csv_path": str(csv_path),
         "top_down_path": str(top_down_path),
+        "selected_top_down_path": str(selected_top_down_path),
         "annotated_video_path": str(annotated_video_path),
+        "volleyball_paths": {key: str(value) for key, value in volleyball_paths.items()},
     }
     st.success("Outputs generated successfully.")
 
 
 def _download_button(path: str, label: str, mime: str) -> None:
+    if not path:
+        st.warning("Output file was not generated.")
+        return
     file_path = Path(path)
-    if not file_path.exists():
+    if not file_path.exists() or file_path.is_dir():
         st.warning(f"Missing output file: {file_path}")
         return
     st.download_button(
@@ -556,21 +653,38 @@ def render_results() -> None:
     st.subheader("Step 7: Download Results")
     metrics = results["movement_metrics"]
     jumps = results["jump_summary"]
+    team_ids = results.get("team_track_ids", [])
+    ball_df = results.get("ball_df")
+    contacts_df = results.get("contacts_df")
+    box_score_df = results.get("box_score_df")
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Frames tracked", metrics.get("frames_tracked", 0))
-    col2.metric("Time tracked", f"{metrics.get('time_tracked_seconds', 0):.2f}s")
-    col3.metric("Distance", f"{metrics.get('total_distance_m', 0):.2f} m")
-    col4.metric("Avg speed", f"{metrics.get('average_speed_mps', 0):.2f} m/s")
+    col1.metric("Near-side players", len(team_ids))
+    col2.metric("Ball detections", 0 if ball_df is None else len(ball_df))
+    col3.metric("Contact guesses", 0 if contacts_df is None else len(contacts_df))
+    col4.metric("Selected distance", f"{metrics.get('total_distance_m', 0):.2f} m")
     max_jump = jumps.get("max_jump_height_m")
-    col5.metric("Max jump", "N/A" if max_jump is None else f"{max_jump:.2f} m")
+    col5.metric("Selected max jump", "N/A" if max_jump is None else f"{max_jump:.2f} m")
 
+    st.caption("Near-side team mode assumes a centred back-view recording from behind your team. Ball/contact stats are heuristic unless you provide a volleyball-trained ball model.")
     st.caption(metrics.get("note", ""))
     st.caption(jumps.get("note", ""))
 
+    if box_score_df is not None and not box_score_df.empty:
+        st.subheader("Near-Side Team Box Score")
+        st.dataframe(box_score_df, use_container_width=True, hide_index=True)
+
+    if results.get("player_table") is not None and not results["player_table"].empty:
+        st.subheader("Team Player Movement")
+        st.dataframe(results["player_table"], use_container_width=True, hide_index=True)
+
+    if contacts_df is not None and not contacts_df.empty:
+        st.subheader("Ball Contact Guesses")
+        st.dataframe(contacts_df, use_container_width=True, hide_index=True)
+
     top_down_path = results["top_down_path"]
     if Path(top_down_path).exists():
-        st.image(top_down_path, caption="Top-down court movement map", use_container_width=False)
+        st.image(top_down_path, caption="Near-side team and ball trajectory map", use_container_width=False)
 
     annotated_path = results["annotated_video_path"]
     if Path(annotated_path).exists() and Path(annotated_path).suffix.lower() == ".mp4":
@@ -582,11 +696,24 @@ def render_results() -> None:
     with col_a:
         _download_button(results["annotated_video_path"], "Download annotated video", "video/mp4")
     with col_b:
-        _download_button(results["csv_path"], "Download tracking CSV", "text/csv")
+        _download_button(results["csv_path"], "Download all-player tracking CSV", "text/csv")
     with col_c:
-        _download_button(results["top_down_path"], "Download court map", "image/png")
+        _download_button(results["top_down_path"], "Download team/ball court map", "image/png")
+
+    volleyball_paths = results.get("volleyball_paths", {})
+    if volleyball_paths:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            _download_button(volleyball_paths.get("team_box_score", ""), "Team box score CSV", "text/csv")
+        with col2:
+            _download_button(volleyball_paths.get("team_players", ""), "Team players CSV", "text/csv")
+        with col3:
+            _download_button(volleyball_paths.get("ball_contacts", ""), "Ball contacts CSV", "text/csv")
+        with col4:
+            _download_button(volleyball_paths.get("ball_tracking", ""), "Ball tracking CSV", "text/csv")
 
     preview_df = results["tracking_df"].head(200)
+    st.subheader("Tracking Preview Rows")
     st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
 

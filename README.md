@@ -13,10 +13,14 @@ The project is inspired by professional sports analytics platforms such as Ballt
 - Homography mapping from camera pixels to real-world court coordinates in metres
 - Volleyball court line overlay on the calibration preview and output video
 - YOLOv8 player detection with configurable confidence threshold
+- Back-view near-side team mode for the six players facing the net away from camera
 - ByteTrack player tracking by default, with BoT-SORT and centroid fallback options
-- Player ID selection after a short preview pass, defaulting to the longest-lived track
+- Player ID preview still available, defaulting to the longest-lived track
+- Optional ball tracking with a general YOLO fallback, best used with volleyball-trained ball weights
+- Heuristic ball-contact and contact-height estimates
+- Team box-score style CSVs for movement, contacts, attack-touch guesses, set-touch guesses, and reception/pass-touch guesses
 - Selected-player movement trail and stats overlay in the exported video
-- Top-down court movement map
+- Top-down court maps for team/player movement and ball trajectory
 - Movement distance, average speed, tracked time, and approximate jump estimates
 - Downloadable `CSV`, annotated video, and court map outputs
 
@@ -94,7 +98,7 @@ For jump signal estimation, the optional pose model is loaded from `models/yolov
 
 ### Player Tracking
 
-The app now uses Ultralytics tracking by default with `bytetrack.yaml`, which is a stronger baseline for keeping persistent player IDs than matching fresh detections manually. `botsort.yaml` is available from the sidebar for clips with heavier overlap or occlusion. A centroid tracker remains as a fallback if the YOLO tracker dependency path fails on a machine.
+The app is now designed first for a centred back-view clip filmed from behind your team. After calibration, it filters tracked players to the camera-side half of the court and chooses up to six longest-lived tracks as the near-side team. It uses Ultralytics tracking by default with `bytetrack.yaml`; `botsort.yaml` is available from the sidebar for clips with heavier overlap or occlusion. A centroid tracker remains as a fallback if the YOLO tracker dependency path fails on a machine.
 
 ### Movement and Jump Analysis
 
@@ -130,8 +134,13 @@ The application will open in your browser. If it does not open automatically, us
 
 Generated files are written to `output/`:
 
-- `annotated_video.mp4`: Original video with court overlay, player boxes, selected-player trail, and stats
+- `annotated_video.mp4`: Original video with court overlay, player boxes, near-side team highlight, selected-player trail, ball trail when detected, and stats
 - `player_tracking.csv`: Per-frame tracking data for all tracked players
+- `team_players.csv`: Near-side team player movement summary
+- `team_box_score.csv`: Volleyball-style heuristic stat sheet for the near-side team
+- `ball_tracking.csv`: Ball detections and approximate mapped court positions
+- `ball_contacts.csv`: Heuristic ball contact/contact-height events
+- `team_ball_court_map.png`: Top-down team and ball trajectory map
 - `top_down_court.png`: Top-down movement path for the selected player
 
 CSV columns:
@@ -147,12 +156,14 @@ detection_confidence, jump_height_estimate_m, notes
 
 ## Limitations
 
+- The app assumes a centred back-view recording from behind the team you want to analyse. Side-view or broadcast footage will reduce team filtering accuracy.
 - Court calibration depends on the user selecting accurate court corners.
-- Homography maps ground-plane positions only; it does not solve full 3D player motion.
+- Homography maps ground-plane positions only; it does not solve full 3D player or ball motion.
+- Ball trajectory and contact-height estimates are heuristic. A volleyball-trained ball detector is needed for useful ball-contact accuracy.
 - Jump height estimates are approximate and depend on camera angle, detection quality, pose quality, and calibration quality.
 - ByteTrack/BoT-SORT can still switch IDs when players overlap heavily, leave frame, or are poorly detected.
 - YOLO detection quality depends on the model weights available in `models/`.
-- The app is designed as a working MVP for portfolio demonstration, not a certified sports science tool.
+- The app is designed as a working MVP for portfolio demonstration, not a certified sports science tool and not a clone of Balltime proprietary AI.
 
 ## Future Improvements
 

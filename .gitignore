@@ -16,3 +16,5 @@ output/*
 .env
 /yolov8n-pose.pt
 /volleyball_detector/
+/yolov8n.pt
+/runs/

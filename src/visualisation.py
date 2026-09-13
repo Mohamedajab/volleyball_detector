@@ -33,9 +33,12 @@ def draw_player_boxes(frame: np.ndarray, frame_records, selected_track_id: int |
             continue
         track_id = int(record["track_id"])
         is_selected = selected_track_id is not None and track_id == int(selected_track_id)
-        color = (0, 140, 255) if is_selected else (40, 220, 90)
-        thickness = 3 if is_selected else 2
-        label = f"Selected Player ID: {track_id}" if is_selected else f"ID {track_id}"
+        is_team = bool(record.get("team_player", False))
+        color = (0, 140, 255) if is_selected else ((255, 210, 70) if is_team else (40, 220, 90))
+        thickness = 3 if is_selected or is_team else 2
+        label = f"Team ID {track_id}" if is_team else f"ID {track_id}"
+        if is_selected:
+            label = f"Selected Player ID: {track_id}"
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
         label_y = max(22, y1 - 8)
@@ -126,6 +129,59 @@ def generate_top_down_court(df: pd.DataFrame, selected_track_id: int, output_pat
     ax.set_ylabel("Court length (m)")
     ax.set_title(f"Selected Player {selected_track_id} Movement Path")
     ax.grid(False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return output_path
+
+
+
+def draw_ball_overlay(frame: np.ndarray, ball_record: dict | None, ball_trail: list[tuple[float, float]]) -> np.ndarray:
+    annotated = frame.copy()
+    points = [(int(round(x)), int(round(y))) for x, y in ball_trail[-80:] if np.isfinite(x) and np.isfinite(y)]
+    for index in range(1, len(points)):
+        cv2.line(annotated, points[index - 1], points[index], (255, 80, 40), 2, cv2.LINE_AA)
+    if ball_record is not None:
+        x = int(round(ball_record["ball_center_x"]))
+        y = int(round(ball_record["ball_center_y"]))
+        cv2.circle(annotated, (x, y), 7, (255, 80, 40), -1, cv2.LINE_AA)
+        cv2.putText(annotated, "Ball", (x + 9, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 80, 40), 2, cv2.LINE_AA)
+    return annotated
+
+
+def generate_team_ball_court_map(player_df: pd.DataFrame, ball_df: pd.DataFrame, team_track_ids: list[int], output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    team_ids = {int(track_id) for track_id in team_track_ids}
+    team = player_df[player_df["track_id"].astype(int).isin(team_ids)].dropna(subset=["court_x_m", "court_y_m"]) if not player_df.empty else pd.DataFrame()
+    ball = ball_df.dropna(subset=["court_x_m", "court_y_m"]) if ball_df is not None and not ball_df.empty else pd.DataFrame()
+
+    fig, ax = plt.subplots(figsize=(5.8, 9.4))
+    ax.set_facecolor("#15463d")
+    fig.patch.set_facecolor("#ffffff")
+    court = plt.Rectangle((0, 0), COURT_WIDTH_M, COURT_LENGTH_M, facecolor="#d8a85f", edgecolor="white", linewidth=2.2)
+    ax.add_patch(court)
+    ax.plot([0, COURT_WIDTH_M], [CENTER_LINE_Y_M, CENTER_LINE_Y_M], color="white", linewidth=2.2)
+    for y_value in ATTACK_LINE_Y_M:
+        ax.plot([0, COURT_WIDTH_M], [y_value, y_value], color="white", linewidth=1.5, linestyle="--")
+
+    if not team.empty:
+        for track_id, group in team.groupby("track_id"):
+            ax.plot(group["court_x_m"], group["court_y_m"], linewidth=1.2, alpha=0.65, label=f"P{int(track_id)}")
+            ax.scatter(group["court_x_m"].iloc[-1], group["court_y_m"].iloc[-1], s=42, edgecolor="white")
+
+    if not ball.empty:
+        ax.plot(ball["court_x_m"], ball["court_y_m"], color="#1f5eff", linewidth=1.6, alpha=0.8, label="Ball path")
+        ax.scatter(ball["court_x_m"], ball["court_y_m"], c=ball["frame_number"], cmap="cool", s=20, edgecolor="white", linewidth=0.2)
+
+    ax.text(COURT_WIDTH_M / 2, 0.35, "Camera-side team", color="white", ha="center", va="bottom", fontsize=10)
+    ax.set_xlim(-0.7, COURT_WIDTH_M + 0.7)
+    ax.set_ylim(-0.7, COURT_LENGTH_M + 0.7)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Court width (m)")
+    ax.set_ylabel("Court length (m)")
+    ax.set_title("Near-side Team + Ball Trajectory Map")
+    if len(ax.get_legend_handles_labels()[0]) <= 10:
+        ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)

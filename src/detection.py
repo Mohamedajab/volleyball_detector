@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover - handled in the Streamlit UI.
 
 
 PLAYER_CLASS_TOKENS = ("person", "player", "athlete")
+BALL_CLASS_TOKENS = ("ball", "sports_ball", "volleyball")
 POSE_COM_KEYPOINTS = (5, 6, 11, 12)  # shoulders and hips in YOLO pose format
 
 
@@ -66,6 +67,21 @@ def load_pose_model() -> tuple[Any | None, str | None]:
     if model_path is None:
         return None, None
     return YOLO(str(model_path)), str(model_path)
+
+
+def load_ball_model() -> tuple[Any | None, str | None]:
+    """Load a general YOLO model for ball detection when available."""
+    if YOLO is None:
+        return None, None
+
+    for path in _candidate_model_paths("yolov8n.pt"):
+        if path.exists():
+            return YOLO(str(path)), str(path)
+
+    try:
+        return YOLO("yolov8n.pt"), "yolov8n.pt (Ultralytics ball fallback)"
+    except Exception:
+        return None, None
 
 
 def _normalise_class_name(name: str) -> str:
@@ -169,3 +185,48 @@ def estimate_pose_vertical_signal(pose_model: Any, frame: np.ndarray, bbox: tupl
         return None
     return float(np.mean(valid_y_values))
 
+
+
+
+def _looks_like_ball_class(class_name: str) -> bool:
+    normalised = _normalise_class_name(class_name)
+    return any(token in normalised for token in BALL_CLASS_TOKENS)
+
+
+def detect_balls(model: Any, frame: np.ndarray, confidence_threshold: float = 0.15) -> list[Detection]:
+    """Detect ball candidates. Works best with a model trained on volleyballs."""
+    if model is None:
+        return []
+
+    try:
+        results = model.predict(frame, conf=confidence_threshold, verbose=False)
+    except Exception:
+        return []
+    if not results:
+        return []
+
+    result = results[0]
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    names = _names_to_dict(getattr(result, "names", None) or getattr(model, "names", None))
+    xyxy = boxes.xyxy.detach().cpu().numpy()
+    confidences = boxes.conf.detach().cpu().numpy()
+    classes = boxes.cls.detach().cpu().numpy() if boxes.cls is not None else np.full(len(xyxy), -1)
+
+    detections: list[Detection] = []
+    for bbox, conf, class_id in zip(xyxy, confidences, classes):
+        class_id_int = int(class_id) if class_id >= 0 else None
+        class_name = names.get(class_id_int, "")
+        if not _looks_like_ball_class(class_name):
+            continue
+
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        width = max(0.0, x2 - x1)
+        height = max(0.0, y2 - y1)
+        if width < 3 or height < 3:
+            continue
+        detections.append(Detection((x1, y1, x2, y2), float(conf), class_id_int, class_name))
+
+    return sorted(detections, key=lambda item: item.confidence, reverse=True)
