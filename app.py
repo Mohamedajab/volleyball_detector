@@ -28,7 +28,8 @@ from src.config import (
     SUPPORTED_VIDEO_TYPES,
     TRACKER_BACKENDS,
 )
-from src.detection import detect_balls, load_ball_model, load_detection_model, load_pose_model
+from src import detection as detection_module
+from src.detection import load_detection_model, load_pose_model
 from src.export_utils import write_annotated_video, write_tracking_csv
 from src.tracking import run_tracking_on_video
 from src.video_utils import (
@@ -92,7 +93,10 @@ def cached_pose_model():
 
 @st.cache_resource(show_spinner=False)
 def cached_ball_model():
-    return load_ball_model()
+    loader = getattr(detection_module, "load_ball_model", None)
+    if loader is None:
+        return None, None
+    return loader()
 
 
 @st.cache_data(show_spinner=False)
@@ -143,7 +147,8 @@ def run_ball_tracking_pass(video_path: str, ball_model, pixel_to_court_matrix, f
             if not ok:
                 break
             timestamp = frame_number / fps if fps > 0 else 0.0
-            balls = detect_balls(ball_model, frame, confidence_threshold=0.12)
+            detector = getattr(detection_module, "detect_balls", None)
+            balls = detector(ball_model, frame, confidence_threshold=0.12) if detector is not None else []
             if balls:
                 records.append(estimate_ball_record(balls[0], frame_number, timestamp, pixel_to_court_matrix))
             frame_number += 1
