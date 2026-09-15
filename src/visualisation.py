@@ -91,6 +91,21 @@ def draw_stats_overlay(frame: np.ndarray, stats: dict) -> np.ndarray:
     return annotated
 
 
+def draw_contact_overlay(frame: np.ndarray, contact: dict | None) -> np.ndarray:
+    if not contact:
+        return frame
+    annotated = frame.copy()
+    height = contact.get("contact_height_estimate_m")
+    height_text = f" | {float(height):.2f} m" if pd.notna(height) else ""
+    confidence = float(contact.get("event_confidence", 0))
+    action = str(contact.get("action_guess", "contact")).replace(" contact candidate", "").upper()
+    text = f"{contact.get('player_id', '')} {action}{height_text} | confidence {confidence:.0%}"
+    cv2.rectangle(annotated, (12, 154), (min(720, annotated.shape[1] - 12), 202), (15, 20, 28), -1)
+    cv2.putText(annotated, text, (26, 187), cv2.FONT_HERSHEY_SIMPLEX, 0.72,
+                (70, 220, 255), 2, cv2.LINE_AA)
+    return annotated
+
+
 def generate_top_down_court(df: pd.DataFrame, selected_track_id: int, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     selected = df[df["track_id"] == selected_track_id].dropna(subset=["court_x_m", "court_y_m"]).sort_values("frame_number")
@@ -175,7 +190,9 @@ def generate_team_ball_court_map(player_df: pd.DataFrame, ball_df: pd.DataFrame,
             ax.scatter(group["court_x_m"].iloc[-1], group["court_y_m"].iloc[-1], s=42, edgecolor="white")
 
     if not ball.empty:
-        ax.plot(ball["court_x_m"], ball["court_y_m"], color="#1f5eff", linewidth=1.6, alpha=0.8, label="Ball path")
+        projected = ball[["court_x_m", "court_y_m"]].copy()
+        projected.loc[ball.timestamp_seconds.diff() > 0.25] = np.nan
+        ax.plot(projected["court_x_m"], projected["court_y_m"], color="#1f5eff", linewidth=1.6, alpha=0.8, label="Ball image projection (not 3D)")
         ax.scatter(ball["court_x_m"], ball["court_y_m"], c=ball["frame_number"], cmap="cool", s=20, edgecolor="white", linewidth=0.2)
 
     ax.text(COURT_WIDTH_M / 2, 0.35, "Camera-side team", color="white", ha="center", va="bottom", fontsize=10)
@@ -184,7 +201,7 @@ def generate_team_ball_court_map(player_df: pd.DataFrame, ball_df: pd.DataFrame,
     ax.set_aspect("equal")
     ax.set_xlabel("Court width (m)")
     ax.set_ylabel("Court length (m)")
-    ax.set_title("Near-side Team + Ball Trajectory Map")
+    ax.set_title("Team movement + ball image projection")
     if len(ax.get_legend_handles_labels()[0]) <= 10:
         ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()

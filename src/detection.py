@@ -46,17 +46,19 @@ def find_pose_model_path() -> Path | None:
     return None
 
 
-def load_detection_model() -> tuple[Any, str]:
+def load_detection_model(model_choice="yolo26s.pt") -> tuple[Any, str]:
     """Load the preferred player detector, falling back to YOLOv8 nano if needed."""
     if YOLO is None:
         raise RuntimeError("ultralytics is not installed. Run: pip install -r requirements.txt")
 
-    model_path = find_detection_model_path()
+    model_path = find_detection_model_path() if model_choice == "custom/local" else next((p for p in _candidate_model_paths(model_choice) if p.exists()), None)
     if model_path is not None:
         return YOLO(str(model_path)), str(model_path)
 
     # Ultralytics downloads this on first use when network is available.
-    return YOLO("yolov8n.pt"), "yolov8n.pt (Ultralytics fallback)"
+    if model_choice == "custom/local":
+        raise RuntimeError("No local model found. Place player weights in models/best.pt or choose YOLO26.")
+    return YOLO(model_choice), model_choice
 
 
 def load_pose_model() -> tuple[Any | None, str | None]:
@@ -64,9 +66,12 @@ def load_pose_model() -> tuple[Any | None, str | None]:
         return None, None
 
     model_path = find_pose_model_path()
-    if model_path is None:
+    if model_path is not None:
+        return YOLO(str(model_path)), str(model_path)
+    try:
+        return YOLO("yolo26n-pose.pt"), "yolo26n-pose.pt"
+    except Exception:
         return None, None
-    return YOLO(str(model_path)), str(model_path)
 
 
 def load_ball_model() -> tuple[Any | None, str | None]:
@@ -74,12 +79,12 @@ def load_ball_model() -> tuple[Any | None, str | None]:
     if YOLO is None:
         return None, None
 
-    for path in _candidate_model_paths("yolov8n.pt"):
+    for path in _candidate_model_paths("ball.pt"):
         if path.exists():
             return YOLO(str(path)), str(path)
 
     try:
-        return YOLO("yolov8n.pt"), "yolov8n.pt (Ultralytics ball fallback)"
+        return YOLO("yolo26s.pt"), "yolo26s.pt (general sports-ball detector)"
     except Exception:
         return None, None
 
@@ -145,32 +150,32 @@ def detect_players(model: Any, frame: np.ndarray, confidence_threshold: float = 
     return detections
 
 
-def estimate_pose_vertical_signal(pose_model: Any, frame: np.ndarray, bbox: tuple[float, float, float, float]) -> float | None:
-    """Estimate a selected player's centre-of-mass y coordinate from pose keypoints."""
+def estimate_pose_features(pose_model: Any, frame: np.ndarray, bbox: tuple[float, float, float, float]) -> dict:
+    """Return body centre and wrist pixels for contact-aware analysis."""
     if pose_model is None:
-        return None
+        return {}
 
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = [int(round(v)) for v in bbox]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(width - 1, x2), min(height - 1, y2)
     if x2 <= x1 or y2 <= y1:
-        return None
+        return {}
 
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
-        return None
+        return {}
 
     try:
         results = pose_model.predict(crop, conf=0.25, verbose=False)
     except Exception:
-        return None
+        return {}
 
     if not results:
-        return None
+        return {}
     keypoints = getattr(results[0], "keypoints", None)
     if keypoints is None or getattr(keypoints, "xy", None) is None or len(keypoints.xy) == 0:
-        return None
+        return {}
 
     points = keypoints.xy[0].detach().cpu().numpy()
     valid_y_values: list[float] = []
@@ -182,8 +187,17 @@ def estimate_pose_vertical_signal(pose_model: Any, frame: np.ndarray, bbox: tupl
             valid_y_values.append(float(py + y1))
 
     if len(valid_y_values) < 2:
-        return None
-    return float(np.mean(valid_y_values))
+        return {}
+    features = {"pose_com_y": float(np.mean(valid_y_values))}
+    for name, index in (("left_wrist", 9), ("right_wrist", 10)):
+        if index < len(points) and points[index][0] > 0 and points[index][1] > 0:
+            features[f"{name}_x"] = float(points[index][0] + x1)
+            features[f"{name}_y"] = float(points[index][1] + y1)
+    return features
+
+
+def estimate_pose_vertical_signal(pose_model: Any, frame: np.ndarray, bbox) -> float | None:
+    return estimate_pose_features(pose_model, frame, bbox).get("pose_com_y")
 
 
 
@@ -199,7 +213,7 @@ def detect_balls(model: Any, frame: np.ndarray, confidence_threshold: float = 0.
         return []
 
     try:
-        results = model.predict(frame, conf=confidence_threshold, verbose=False)
+        results = model.predict(frame, conf=confidence_threshold, imgsz=1280, verbose=False)
     except Exception:
         return []
     if not results:

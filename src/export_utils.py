@@ -9,7 +9,7 @@ import pandas as pd
 from .analysis import cumulative_distance_by_frame, dataframe_for_csv
 from .calibration import draw_court_lines
 from .config import OUTPUT_DIR
-from .visualisation import draw_ball_overlay, draw_player_boxes, draw_selected_trail, draw_stats_overlay
+from .visualisation import draw_ball_overlay, draw_contact_overlay, draw_player_boxes, draw_selected_trail, draw_stats_overlay
 
 
 def ensure_output_folders() -> None:
@@ -51,6 +51,7 @@ def write_annotated_video(
     progress_callback: Callable[[float, str], None] | None = None,
     ball_df: pd.DataFrame | None = None,
     team_track_ids: list[int] | None = None,
+    contacts_df: pd.DataFrame | None = None,
 ) -> Path:
     ensure_output_folders()
     output_path = output_path or (OUTPUT_DIR / "annotated_video.mp4")
@@ -84,6 +85,13 @@ def write_annotated_video(
     ball_by_frame = {}
     if ball_df is not None and not ball_df.empty:
         ball_by_frame = {int(row.frame_number): row._asdict() for row in ball_df.sort_values("frame_number").itertuples(index=False)}
+    contact_by_frame = {}
+    if contacts_df is not None and not contacts_df.empty:
+        hold_frames = max(1, int(round(fps * 0.7)))
+        for row in contacts_df.itertuples(index=False):
+            event = row._asdict()
+            for visible_frame in range(int(row.frame_number), int(row.frame_number) + hold_frames):
+                contact_by_frame[visible_frame] = event
 
     trail_points: list[tuple[float, float]] = []
     ball_trail: list[tuple[float, float]] = []
@@ -115,6 +123,7 @@ def write_annotated_video(
             annotated = draw_selected_trail(annotated, trail_points)
             annotated = draw_ball_overlay(annotated, ball_record, ball_trail)
             annotated = draw_player_boxes(annotated, grouped.get(frame_number), selected_track_id=selected_track_id)
+            annotated = draw_contact_overlay(annotated, contact_by_frame.get(frame_number))
             annotated = draw_stats_overlay(
                 annotated,
                 {

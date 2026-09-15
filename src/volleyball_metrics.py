@@ -15,74 +15,7 @@ CONTACT_RADIUS_PX = 85.0
 CONTACT_COOLDOWN_FRAMES = 8
 
 
-ROSTER_ANCHORS = {
-    "Z5": {"label": "Z5 back-left", "anchor": (COURT_WIDTH_M * 1 / 6, CENTER_LINE_Y_M * 0.32)},
-    "Z6": {"label": "Z6 back-middle", "anchor": (COURT_WIDTH_M * 3 / 6, CENTER_LINE_Y_M * 0.32)},
-    "Z1": {"label": "Z1 back-right", "anchor": (COURT_WIDTH_M * 5 / 6, CENTER_LINE_Y_M * 0.32)},
-    "Z4": {"label": "Z4 front-left", "anchor": (COURT_WIDTH_M * 1 / 6, CENTER_LINE_Y_M * 0.78)},
-    "Z3": {"label": "Z3 front-middle", "anchor": (COURT_WIDTH_M * 3 / 6, CENTER_LINE_Y_M * 0.78)},
-    "Z2": {"label": "Z2 front-right", "anchor": (COURT_WIDTH_M * 5 / 6, CENTER_LINE_Y_M * 0.78)},
-}
-ROSTER_ORDER = ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6"]
-
-
-def assign_near_side_roster_slots(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse noisy raw track IDs into six fixed near-side volleyball roster slots.
-
-    The raw tracker can create many short IDs when players overlap. For a back-view
-    volleyball clip, court position is more stable than raw ID, so each frame is
-    greedily assigned to the six near-side zone anchors. Raw track IDs are kept in
-    the CSV, but the user-facing identity becomes roster_id/roster_zone.
-    """
-    output = df.copy()
-    output["team_player"] = False
-    output["team_side"] = "other"
-    output["roster_id"] = ""
-    output["roster_zone"] = ""
-    output["raw_track_id"] = output["track_id"] if "track_id" in output else np.nan
-    if output.empty or "court_x_m" not in output or "court_y_m" not in output:
-        return output
-
-    for frame_number, frame_group in output.groupby("frame_number"):
-        eligible = frame_group.dropna(subset=["court_x_m", "court_y_m"])
-        eligible = eligible[
-            (eligible["court_x_m"] >= -0.75)
-            & (eligible["court_x_m"] <= COURT_WIDTH_M + 0.75)
-            & (eligible["court_y_m"] >= -0.75)
-            & (eligible["court_y_m"] <= CENTER_LINE_Y_M + 0.9)
-        ]
-        if eligible.empty:
-            continue
-
-        candidate_pairs = []
-        for row in eligible.itertuples():
-            for slot_id, slot_data in ROSTER_ANCHORS.items():
-                anchor = slot_data["anchor"]
-                distance = math.hypot(float(row.court_x_m) - anchor[0], float(row.court_y_m) - anchor[1])
-                candidate_pairs.append((distance, row.Index, slot_id, slot_data["label"]))
-
-        used_rows = set()
-        used_slots = set()
-        for distance, row_index, slot_id, slot_name in sorted(candidate_pairs, key=lambda item: item[0]):
-            if row_index in used_rows or slot_id in used_slots:
-                continue
-            used_rows.add(row_index)
-            used_slots.add(slot_id)
-            output.at[row_index, "team_player"] = True
-            output.at[row_index, "team_side"] = NEAR_SIDE_LABEL
-            output.at[row_index, "roster_id"] = slot_id
-            output.at[row_index, "roster_zone"] = slot_name
-            if len(used_slots) >= 6:
-                break
-
-    return output
-
-
-def roster_ids_from_dataframe(df: pd.DataFrame) -> list[str]:
-    if df.empty or "roster_id" not in df:
-        return []
-    found = [value for value in df["roster_id"].dropna().unique().tolist() if str(value).strip()]
-    return [slot_id for slot_id in ROSTER_ORDER if slot_id in set(map(str, found))]
+from .roster import assign_near_side_roster_slots, roster_ids_from_dataframe
 
 
 def select_near_side_team(df: pd.DataFrame, max_players: int = 6) -> list[int]:
@@ -133,7 +66,7 @@ def estimate_player_table(df: pd.DataFrame, player_ids: list, fps: float, id_col
             if previous is not None:
                 dt = max(current[2] - previous[2], 1.0 / max(fps, 1.0))
                 step = math.hypot(current[0] - previous[0], current[1] - previous[1])
-                if step / dt <= 10.0:
+                if dt <= 0.25 and step / dt <= 10.0:
                     distance += step
             previous = current
 
@@ -219,84 +152,156 @@ def estimate_ball_record(ball_detection, frame_number: int, timestamp_seconds: f
     }
 
 
-def estimate_contacts(player_df: pd.DataFrame, ball_df: pd.DataFrame, player_ids: list, fps: float) -> pd.DataFrame:
+def estimate_contacts(
+    player_df: pd.DataFrame,
+    ball_df: pd.DataFrame,
+    player_ids: list,
+    fps: float,
+    projection_matrix_3d=None,
+) -> pd.DataFrame:
+    """Find reviewable hand-ball contacts from proximity and trajectory change."""
+    from .camera_3d import estimate_height_above_ground
+
     columns = [
-        "frame_number",
-        "timestamp_seconds",
-        "player_id",
-        "raw_track_id",
-        "action_guess",
-        "court_x_m",
-        "court_y_m",
-        "ball_court_x_m",
-        "ball_court_y_m",
-        "contact_height_estimate_m",
-        "confidence_note",
+        "frame_number", "timestamp_seconds", "player_id", "raw_track_id",
+        "action_guess", "court_x_m", "court_y_m", "ball_court_x_m",
+        "ball_court_y_m", "contact_height_estimate_m",
+        "height_reprojection_error_px", "hand_distance_px",
+        "trajectory_change_score", "event_confidence", "confidence_note",
     ]
     if player_df.empty or ball_df.empty or not player_ids:
         return pd.DataFrame(columns=columns)
 
-    id_column = "roster_id" if "roster_id" in player_df and any(str(value).strip() for value in player_df["roster_id"].dropna().unique()) else "track_id"
-    wanted_ids = {str(player_id) for player_id in player_ids}
-    team = player_df[player_df[id_column].astype(str).isin(wanted_ids)].copy()
+    id_column = "roster_id" if "roster_id" in player_df else "track_id"
+    wanted = {str(value) for value in player_ids}
+    team = player_df[player_df[id_column].astype(str).isin(wanted)].copy()
     if team.empty:
         return pd.DataFrame(columns=columns)
 
-    player_by_frame = {int(frame): group for frame, group in team.groupby("frame_number")}
+    balls = ball_df.sort_values("frame_number").reset_index(drop=True)
+    players_by_frame = {int(frame): group for frame, group in team.groupby("frame_number")}
     events = []
     last_contact_frame = -10_000
-    previous_ball = None
 
-    for ball in ball_df.itertuples(index=False):
+    for index in range(1, len(balls) - 1):
+        ball = balls.iloc[index]
+        before, after = balls.iloc[index - 1], balls.iloc[index + 1]
         frame_number = int(ball.frame_number)
-        players = player_by_frame.get(frame_number)
-        if players is None or frame_number - last_contact_frame < CONTACT_COOLDOWN_FRAMES:
-            previous_ball = ball
+        if frame_number - last_contact_frame < CONTACT_COOLDOWN_FRAMES:
             continue
+        if float(ball.timestamp_seconds - before.timestamp_seconds) > 0.2:
+            continue
+        if float(after.timestamp_seconds - ball.timestamp_seconds) > 0.2:
+            continue
+
+        incoming = np.array([
+            ball.ball_center_x - before.ball_center_x,
+            ball.ball_center_y - before.ball_center_y,
+        ], dtype=float)
+        outgoing = np.array([
+            after.ball_center_x - ball.ball_center_x,
+            after.ball_center_y - ball.ball_center_y,
+        ], dtype=float)
+        incoming_norm = float(np.linalg.norm(incoming))
+        outgoing_norm = float(np.linalg.norm(outgoing))
+        if incoming_norm < 1 or outgoing_norm < 1:
+            continue
+        direction_change = 1.0 - float(
+            np.clip((incoming @ outgoing) / (incoming_norm * outgoing_norm), -1.0, 1.0)
+        )
+        speed_change = abs(outgoing_norm - incoming_norm) / max(incoming_norm, outgoing_norm)
+        trajectory_score = float(np.clip(0.65 * direction_change + 0.35 * speed_change, 0, 1))
+
+        nearby = []
+        for offset in (0, -1, 1):
+            group = players_by_frame.get(frame_number + offset)
+            if group is not None:
+                nearby.append(group)
+        if not nearby:
+            continue
+        players = pd.concat(nearby).sort_values("frame_number")
+        ball_pixel = np.array([ball.ball_center_x, ball.ball_center_y], dtype=float)
 
         candidates = []
         for player in players.itertuples(index=False):
-            court_distance = np.inf
-            if pd.notna(ball.court_x_m) and pd.notna(ball.court_y_m) and pd.notna(player.court_x_m) and pd.notna(player.court_y_m):
-                court_distance = math.hypot(float(ball.court_x_m) - float(player.court_x_m), float(ball.court_y_m) - float(player.court_y_m))
-            pixel_distance = math.hypot(float(ball.ball_center_x) - float(player.bbox_center_x), float(ball.ball_center_y) - float(player.bbox_center_y))
-            if court_distance <= CONTACT_RADIUS_M or pixel_distance <= CONTACT_RADIUS_PX:
-                candidates.append((court_distance, pixel_distance, player))
-
+            bbox_height = max(1.0, float(player.bbox_y2) - float(player.bbox_y1))
+            hands = []
+            for prefix in ("left_wrist", "right_wrist"):
+                x, y = getattr(player, prefix + "_x", np.nan), getattr(player, prefix + "_y", np.nan)
+                if pd.notna(x) and pd.notna(y):
+                    hands.append(np.array([x, y], dtype=float))
+            pose_hands = bool(hands)
+            if not hands:
+                hands = [np.array([player.bbox_center_x, player.bbox_y1 + 0.18 * bbox_height])]
+            hand_distance = min(float(np.linalg.norm(ball_pixel - hand)) for hand in hands)
+            threshold = bbox_height * (0.38 if pose_hands else 0.25)
+            if hand_distance <= threshold:
+                candidates.append((hand_distance / threshold, hand_distance, pose_hands, player))
         if not candidates:
-            previous_ball = ball
             continue
 
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        _, _, player = candidates[0]
-        bbox_height_px = max(1.0, float(player.bbox_y2) - float(player.bbox_y1))
-        pixels_above_feet = max(0.0, float(player.foot_pixel_y) - float(ball.ball_center_y))
-        contact_height = min(3.8, max(0.0, (pixels_above_feet / bbox_height_px) * ESTIMATED_PLAYER_HEIGHT_M))
+        normalised_distance, hand_distance, pose_hands, player = min(candidates, key=lambda value: value[0])
+        # A visible hand-ball overlap is strong evidence; a trajectory change adds
+        # support and rejects balls merely passing near a player.
+        if trajectory_score < 0.12 and normalised_distance > 0.45:
+            continue
 
-        if pd.notna(ball.court_y_m) and float(ball.court_y_m) >= CENTER_LINE_Y_M - 1.0:
-            action = "attack/block touch guess"
-        elif previous_ball is not None and pd.notna(previous_ball.court_y_m) and pd.notna(ball.court_y_m):
-            action = "set/pass guess" if float(ball.court_y_m) > float(previous_ball.court_y_m) else "dig/reception guess"
+        height = np.nan
+        residual = np.nan
+        height_note = "height unavailable: select both net-tape endpoints"
+        if projection_matrix_3d is not None and pd.notna(player.court_x_m) and pd.notna(player.court_y_m):
+            fitted, residual = estimate_height_above_ground(
+                projection_matrix_3d,
+                (float(player.court_x_m), float(player.court_y_m)),
+                (float(ball.ball_center_x), float(ball.ball_center_y)),
+            )
+            tolerance = max(10.0, (float(player.bbox_x2) - float(player.bbox_x1)) * 0.35)
+            if fitted is not None and residual <= tolerance:
+                height = round(float(fitted), 2)
+                height_note = f"vertical fit residual {residual:.1f} px"
+            else:
+                height_note = f"height rejected: vertical fit residual {residual:.1f} px"
+
+        high_contact = pd.notna(height) and height >= 2.25
+        front_row = pd.notna(player.court_y_m) and float(player.court_y_m) >= CENTER_LINE_Y_M - 3.2
+        outgoing_rises = outgoing[1] < -max(2.0, outgoing_norm * 0.2)
+        if high_contact and front_row and not outgoing_rises:
+            action = "attack contact candidate"
+        elif outgoing_rises and (high_contact or pose_hands):
+            action = "set contact candidate"
+        elif high_contact and front_row:
+            action = "block contact candidate"
         else:
-            action = "contact guess"
+            action = "pass/dig contact candidate"
 
-        events.append(
-            {
-                "frame_number": frame_number,
-                "timestamp_seconds": float(ball.timestamp_seconds),
-                "player_id": str(getattr(player, id_column)),
-                "raw_track_id": int(player.raw_track_id) if hasattr(player, "raw_track_id") and pd.notna(player.raw_track_id) else int(player.track_id),
-                "action_guess": action,
-                "court_x_m": float(player.court_x_m) if pd.notna(player.court_x_m) else np.nan,
-                "court_y_m": float(player.court_y_m) if pd.notna(player.court_y_m) else np.nan,
-                "ball_court_x_m": float(ball.court_x_m) if pd.notna(ball.court_x_m) else np.nan,
-                "ball_court_y_m": float(ball.court_y_m) if pd.notna(ball.court_y_m) else np.nan,
-                "contact_height_estimate_m": round(contact_height, 2),
-                "confidence_note": "Heuristic proximity event; requires a volleyball-trained ball model for high accuracy.",
-            }
-        )
+        confidence = float(np.clip(
+            0.45 * (1 - normalised_distance)
+            + 0.30 * trajectory_score
+            + 0.15 * float(ball.confidence)
+            + 0.10 * pose_hands,
+            0, 1,
+        ))
+        events.append({
+            "frame_number": frame_number,
+            "timestamp_seconds": float(ball.timestamp_seconds),
+            "player_id": str(getattr(player, id_column)),
+            "raw_track_id": int(player.raw_track_id),
+            "action_guess": action,
+            "court_x_m": float(player.court_x_m),
+            "court_y_m": float(player.court_y_m),
+            "ball_court_x_m": float(ball.court_x_m) if pd.notna(ball.court_x_m) else np.nan,
+            "ball_court_y_m": float(ball.court_y_m) if pd.notna(ball.court_y_m) else np.nan,
+            "contact_height_estimate_m": height,
+            "height_reprojection_error_px": round(float(residual), 2) if pd.notna(residual) else np.nan,
+            "hand_distance_px": round(hand_distance, 2),
+            "trajectory_change_score": round(trajectory_score, 3),
+            "event_confidence": round(confidence, 3),
+            "confidence_note": (
+                ("pose wrists; " if pose_hands else "bbox hand fallback; ")
+                + height_note + "; requires video review"
+            ),
+        })
         last_contact_frame = frame_number
-        previous_ball = ball
 
     return pd.DataFrame(events, columns=columns)
 

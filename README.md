@@ -12,12 +12,13 @@ The project is inspired by professional sports analytics platforms such as Ballt
 - Manual volleyball court calibration using four selected court corners
 - Homography mapping from camera pixels to real-world court coordinates in metres
 - Volleyball court line overlay on the calibration preview and output video
-- YOLOv8 player detection with configurable confidence threshold
+- YOLO26 player detection by default, with larger and local custom-weight choices
 - Back-view near-side team mode for the six players facing the net away from camera
-- ByteTrack player tracking by default, with BoT-SORT and centroid fallback options
-- Six-slot roster preview that collapses noisy raw tracklets into Z1-Z6 court roles
-- Optional ball tracking with a general YOLO fallback, best used with volleyball-trained ball weights
-- Heuristic ball-contact and contact-height estimates
+- Appearance-assisted BoT-SORT tracking, with ByteTrack, OC-SORT and centroid alternatives
+- Explicit six-player roster lock with stable P1-P6 identities independent of court rotation
+- Temporal ball tracking, best used with volleyball-trained models/ball.pt
+- Two-point net-tape calibration for metric contact-height estimates
+- Wrist pose analysis focused around likely ball contacts
 - Team box-score style CSVs for movement, contacts, attack-touch guesses, set-touch guesses, and reception/pass-touch guesses
 - Selected-player movement trail and stats overlay in the exported video
 - Top-down court maps for team/player movement and ball trajectory
@@ -33,7 +34,7 @@ The project is inspired by professional sports analytics platforms such as Ballt
    near left, near right, far right, far left.
 5. Confirm the court overlay preview.
 6. Run a short detection/tracking preview.
-7. Review the Z1-Z6 near-side roster preview and optionally choose one raw track for an individual video trail.
+7. Pick a frame showing all six teammates, lock those six detections, and choose P1-P6 for the highlighted trail.
 8. Process the full video.
 9. Download:
    `output/annotated_video.mp4`, `output/player_tracking.csv`, and `output/top_down_court.png`.
@@ -43,7 +44,7 @@ The project is inspired by professional sports analytics platforms such as Ballt
 - Python
 - Streamlit
 - OpenCV
-- Ultralytics YOLOv8
+- Ultralytics YOLO26
 - NumPy
 - Pandas
 - SciPy
@@ -58,11 +59,15 @@ src/
   config.py          App constants, model paths, court dimensions
   video_utils.py     Upload handling, frame extraction, video metadata
   detection.py       YOLO model loading and player detection
-  tracking.py        Centroid tracker and tracking record generation
+  tracking.py        Multi-object tracking and frame observations
+  roster.py          Locked six-player identity association
   calibration.py     Homography, court mapping, court line overlay
+  camera_3d.py       Net-tape vertical calibration and height fitting
+  pose_enrichment.py Wrist pose around tracked-ball frames
   analysis.py        Movement metrics and approximate jump detection
   visualisation.py   Bounding boxes, trails, overlays, top-down map
-  ball_tracking.py    Classical moving bright-object ball fallback
+  ball_tracking.py   Temporal ball association and motion fallback
+  stat_sheet.py      Reviewed volleyball stat calculations
   export_utils.py    CSV and annotated video export
 ```
 
@@ -89,23 +94,29 @@ Detected player foot positions use the bottom centre of each bounding box and ar
 
 ### Player Detection
 
-The detector loads models in this order:
+The default detector is YOLO26 small at 1280-pixel inference. The sidebar also offers YOLO26 medium, YOLO11 small, and local custom weights. Official weights download on first use. A custom detector belongs at models/best.pt and must expose a person, player, or athlete class.
 
-1. `models/best.pt`
-2. `models/yolov8n.pt`
-3. Ultralytics `yolov8n.pt` fallback
-
-For jump signal estimation, the optional pose model is loaded from `models/yolov8n-pose.pt` when available.
+Hand pose uses a local models/yolov8n-pose.pt when present and otherwise tries YOLO26 nano pose. Pose runs only for players nearest the ball on ball-visible frames.
 
 ### Player Tracking
 
-The app is now designed first for a centred back-view clip filmed from behind your team. After calibration, it maps detections to court metres and greedily assigns visible near-side players into six fixed volleyball court zones: Z1, Z2, Z3, Z4, Z5, and Z6. It uses Ultralytics tracking by default with `bytetrack.yaml`; `botsort.yaml` is available from the sidebar for clips with heavier overlap or occlusion. A centroid tracker remains as a fallback if the YOLO tracker dependency path fails on a machine.
+The app is designed for a fixed, centred camera behind the analysed team. Appearance-assisted BoT-SORT is the default. The user selects six near-side detections in one frame. A second global assignment layer keeps P1-P6 using tracker continuity, time gaps, and plausible court movement. The roster never grows beyond six and players are not renamed when they rotate.
+
+Long or ambiguous gaps remain missing instead of being assigned to another person. Substitutions require a new roster lock.
+
+### Ball and Contact Analysis
+
+Ball candidates are associated over time; isolated detections and implausible jumps are rejected. Classical motion candidates can extend an established track but cannot start one. Useful accuracy requires a volleyball-specific models/ball.pt.
+
+Four court corners measure floor positions. Contact height additionally requires clicks on both net-tape endpoints and the correct official net height. A contact candidate requires wrist proximity plus a ball-path change. Height is fitted above the matched player's ground position and rejected when reprojection error is too large.
+
+The top-down ball map is an image projection onto the floor, not the actual airborne 3D path. Defensible 3D trajectory needs a second synchronized camera or a validated monocular model trained with 3D ground truth.
 
 ### Movement and Jump Analysis
 
 Movement distance and speed are calculated from homography-mapped court positions. Unrealistic displacement segments are ignored to reduce tracking error impact.
 
-Jump estimates use the pose centre-of-mass vertical signal when the pose model is available. Otherwise, the app falls back to bounding-box centre movement. These estimates are approximate and should not be treated as precise biomechanical measurements.
+Jump estimates use bounding-box motion and remain approximate. Contact height uses the separate net-tape geometry and wrist/ball event pipeline. Automatic contacts are review candidates. Kills, errors, aces and assists are calculated only from events checked in the reviewed stat editor.
 
 ## Installation
 
@@ -157,26 +168,28 @@ detection_confidence, jump_height_estimate_m, notes
 
 ## Limitations
 
-- The app assumes a centred back-view recording from behind the team you want to analyse. Side-view or broadcast footage will reduce team filtering accuracy.
+- The app assumes a fixed centred back-view recording. Cuts, zooms, pans and broadcast camera changes invalidate calibration.
 - Court calibration depends on the user selecting accurate court corners.
-- Homography maps ground-plane positions only; it does not solve full 3D player or ball motion.
-- Ball trajectory and contact-height estimates are heuristic. A volleyball-trained ball detector is needed for useful ball-contact accuracy.
+- Floor homography does not recover airborne 3D ball position. Net calibration estimates height only at a matched player's horizontal position.
+- Contact height depends on accurate corners, net endpoints, feet, wrists and ball centre. Poor fits are rejected, but accuracy has not yet been measured against ground truth.
+- The general sports-ball model can miss small, blurred or occluded volleyballs. Train a volleyball-specific ball model for useful results.
 - Jump height estimates are approximate and depend on camera angle, detection quality, pose quality, and calibration quality.
-- ByteTrack/BoT-SORT can still switch IDs when players overlap heavily, leave frame, or are poorly detected.
+- Appearance tracking can still switch same-uniform players in heavy overlap. P1-P6 are internal identities, not recognized shirt numbers.
 - YOLO detection quality depends on the model weights available in `models/`.
 - The app is designed as a working MVP for portfolio demonstration, not a certified sports science tool and not a clone of Balltime proprietary AI.
 
 ## Future Improvements
 
-- Train or add volleyball-specific ball and jersey-number detection weights
+- Extract and label volleyball frames with tools/extract_ball_frames.py, then train models/ball.pt with tools/train_ball_model.py
 - Add automatic court line detection as an optional helper
-- Improve player re-identification after occlusion with jersey-number OCR and appearance embeddings
+- Evaluate ball precision/recall, identity switches, contact-frame error and height error on labelled clips
+- Add jersey-number OCR with user correction
 - Add team/side segmentation
-- Add richer event detection for jumps, attacks, serves, and blocks
+- Train a temporal action model for set, attack, serve, pass, dig and block classification
+- Add synchronized second-camera calibration for defensible 3D ball trajectories
 - Add a small sample video and screenshots for the GitHub demo
 - Package the app for deployment on Streamlit Community Cloud
 
 ## Author
 
 Mohamed Ajab
-

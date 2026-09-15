@@ -29,7 +29,7 @@ COURT_CORNERS_M = (
     (0.0, COURT_LENGTH_M),
 )
 
-MODEL_PRIORITY_FILENAMES = ("best.pt", "yolov8n.pt")
+MODEL_PRIORITY_FILENAMES = ("best.pt", "yolo26s.pt", "yolo11s.pt", "yolov8n.pt")
 POSE_MODEL_FILENAME = "yolov8n-pose.pt"
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.35
@@ -37,8 +37,8 @@ DEFAULT_MAX_TRACK_DISTANCE_PX = 90.0
 DEFAULT_MAX_MISSING_FRAMES = 18
 DEFAULT_PREVIEW_SECONDS = 5.0
 MAX_REASONABLE_SPEED_MPS = 10.0
-DEFAULT_TRACKER_BACKEND = "bytetrack.yaml"
-TRACKER_BACKENDS = ("bytetrack.yaml", "botsort.yaml", "centroid fallback")
+DEFAULT_TRACKER_BACKEND = str(PROJECT_ROOT / "configs" / "botsort_volleyball.yaml")
+TRACKER_BACKENDS = (DEFAULT_TRACKER_BACKEND, "botsort.yaml", "bytetrack.yaml", "ocsort.yaml", "centroid fallback")
 
 ESTIMATED_PLAYER_HEIGHT_M = 1.85
 MIN_JUMP_HEIGHT_M = 0.08
@@ -63,4 +63,3 @@ CSV_COLUMNS = [
     "jump_height_estimate_m",
     "notes",
 ]
-

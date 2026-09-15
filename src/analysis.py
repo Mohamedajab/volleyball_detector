@@ -64,7 +64,7 @@ def calculate_movement_metrics(df: pd.DataFrame, selected_track_id: int, fps: fl
             dt = max(current[2] - previous[2], 1.0 / max(fps, 1.0))
             distance = math.hypot(dx, dy)
             speed = distance / dt
-            if speed <= MAX_REASONABLE_SPEED_MPS:
+            if dt <= 0.25 and speed <= MAX_REASONABLE_SPEED_MPS:
                 total_distance += distance
                 accepted_segments += 1
             else:
@@ -234,7 +234,7 @@ def cumulative_distance_by_frame(df: pd.DataFrame, selected_track_id: int, fps: 
         if previous is not None:
             segment_distance = math.hypot(current[0] - previous[0], current[1] - previous[1])
             dt = max(current[2] - previous[2], 1.0 / max(fps, 1.0))
-            if segment_distance / dt <= MAX_REASONABLE_SPEED_MPS:
+            if dt <= 0.25 and segment_distance / dt <= MAX_REASONABLE_SPEED_MPS:
                 distance_total += segment_distance
         cumulative[int(row.frame_number)] = round(float(distance_total), 3)
         previous = current
@@ -247,4 +247,5 @@ def dataframe_for_csv(df: pd.DataFrame) -> pd.DataFrame:
     for column in CSV_COLUMNS:
         if column not in output:
             output[column] = np.nan
-    return output[CSV_COLUMNS]
+    extra = [key for key in ("raw_track_id", "roster_id", "team_player") if key in output]
+    return output[CSV_COLUMNS + extra]

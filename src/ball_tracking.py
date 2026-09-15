@@ -34,9 +34,10 @@ def detect_ball_candidates_classical(frame: np.ndarray, previous_frame: np.ndarr
         _, motion_mask = cv2.threshold(motion, 18, 255, cv2.THRESH_BINARY)
         masks.append(cv2.bitwise_and(low_sat_bright, motion_mask))
 
-    combined = masks[0]
-    for mask in masks[1:]:
-        combined = cv2.bitwise_or(combined, mask)
+    # Motion must restrict the mask; OR-ing it with brightness discards it.
+    if previous_frame is None:
+        return []
+    combined = masks[-1]
     combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
@@ -62,3 +63,44 @@ def detect_ball_candidates_classical(frame: np.ndarray, previous_frame: np.ndarr
         candidates.append(Detection((float(x), float(y), float(x + w), float(y + h)), score, None, "ball_classical"))
 
     return sorted(candidates, key=lambda item: item.confidence, reverse=True)
+
+
+class BallTracker:
+    """Associate candidates over time; never report extrapolated detections."""
+
+    def __init__(self):
+        self.position = None
+        self.velocity = np.zeros(2)
+        self.time = None
+        self.confirmations = 0
+
+    def update(self, detections, classical, timestamp, shape):
+        diagonal = float(np.hypot(shape[0], shape[1]))
+        if self.time is not None and timestamp - self.time > 0.25:
+            self.position = None
+            self.confirmations = 0
+        candidates = detections if self.position is None else [*detections, *classical]
+        if not candidates:
+            return None
+        dt = max(timestamp - self.time, 1 / 120) if self.time is not None else 1 / 30
+        prediction = self.position + self.velocity * dt if self.position is not None else None
+        ranked = []
+        for detection in candidates:
+            x1, y1, x2, y2 = detection.bbox
+            center = np.array([(x1+x2)/2, (y1+y2)/2])
+            distance = np.linalg.norm(center - prediction) if prediction is not None else 0.0
+            gate = diagonal * min(0.18, 0.025 + dt * 1.5)
+            if distance > gate:
+                continue
+            penalty = 0.5 if detection.class_name == "ball_classical" else 0.0
+            ranked.append((distance / gate + penalty - detection.confidence, detection, center))
+        if not ranked:
+            return None
+        _, detection, center = min(ranked, key=lambda value: value[0])
+        if self.position is not None:
+            self.velocity = 0.5 * self.velocity + 0.5 * (center-self.position) / dt
+        else:
+            self.velocity = np.zeros(2)
+        self.position, self.time = center, timestamp
+        self.confirmations += 1
+        return detection if self.confirmations >= 2 else None

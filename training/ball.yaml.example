@@ -1,0 +1,5 @@
+path: ../sample_data/ball_dataset
+train: images/train
+val: images/val
+names:
+  0: volleyball

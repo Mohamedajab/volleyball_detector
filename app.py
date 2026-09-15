@@ -8,7 +8,10 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from src.ball_tracking import detect_ball_candidates_classical
+from src.ball_tracking import detect_ball_candidates_classical, BallTracker
+from src.roster import team_records, roster_ids_from_dataframe
+from src.stat_sheet import EVENTS, build_stat_sheet
+from src.pose_enrichment import enrich_hands_near_ball
 from src.analysis import (
     add_jump_annotations,
     calculate_movement_metrics,
@@ -17,6 +20,7 @@ from src.analysis import (
     summarise_jumps,
 )
 from src.calibration import compute_homography, draw_calibration_points, draw_court_lines, validate_corner_points
+from src.camera_3d import build_projection_matrix, draw_net_calibration
 from src.config import (
     APP_DESCRIPTION,
     APP_TITLE,
@@ -50,8 +54,6 @@ from src.volleyball_metrics import (
     estimate_contacts,
     estimate_player_table,
     estimate_team_box_score,
-    assign_near_side_roster_slots,
-    roster_ids_from_dataframe,
     select_near_side_team,
     tag_team_players,
     write_volleyball_outputs,
@@ -75,17 +77,20 @@ STATE_DEFAULTS = {
     "last_click_signature": None,
     "pixel_to_court_matrix": None,
     "court_to_pixel_matrix": None,
+    "net_top_points": [],
+    "projection_matrix_3d": None,
+    "net_height_m": 2.43,
     "preview_records": None,
     "preview_track_ids": [],
     "preview_frame_number": None,
     "selected_track_id": None,
     "results": None,
+    "roster_seeds": None,
 }
 
 
-@st.cache_resource(show_spinner=False)
 def cached_detection_model():
-    return load_detection_model()
+    return load_detection_model(st.session_state.get("model_choice", "yolo26s.pt"))
 
 
 @st.cache_resource(show_spinner=False)
@@ -115,6 +120,7 @@ def initialise_state() -> None:
 
 
 def reset_for_new_video(video_path: Path, signature: str) -> None:
+    st.session_state.roster_seeds = None
     st.session_state.video_path = str(video_path)
     st.session_state.uploaded_signature = signature
     st.session_state.metadata = read_video_metadata(video_path)
@@ -123,6 +129,8 @@ def reset_for_new_video(video_path: Path, signature: str) -> None:
     st.session_state.last_click_signature = None
     st.session_state.pixel_to_court_matrix = None
     st.session_state.court_to_pixel_matrix = None
+    st.session_state.net_top_points = []
+    st.session_state.projection_matrix_3d = None
     st.session_state.preview_records = None
     st.session_state.preview_track_ids = []
     st.session_state.preview_frame_number = None
@@ -142,6 +150,7 @@ def run_ball_tracking_pass(video_path: str, ball_model, pixel_to_court_matrix, f
     records = []
     frame_number = 0
     previous_frame = None
+    ball_tracker = BallTracker()
     try:
         while True:
             if frame_limit is not None and frame_number >= frame_limit:
@@ -153,9 +162,9 @@ def run_ball_tracking_pass(video_path: str, ball_model, pixel_to_court_matrix, f
             detector = getattr(detection_module, "detect_balls", None)
             yolo_balls = detector(ball_model, frame, confidence_threshold=0.12) if detector is not None and ball_model is not None else []
             classical_balls = detect_ball_candidates_classical(frame, previous_frame)
-            balls = sorted([*yolo_balls, *classical_balls], key=lambda item: item.confidence, reverse=True)
-            if balls:
-                records.append(estimate_ball_record(balls[0], frame_number, timestamp, pixel_to_court_matrix))
+            ball = ball_tracker.update(yolo_balls, classical_balls, timestamp, frame.shape)
+            if ball is not None:
+                records.append(estimate_ball_record(ball, frame_number, timestamp, pixel_to_court_matrix))
             previous_frame = frame.copy()
             frame_number += 1
             if progress_callback and frames_to_process:
@@ -181,12 +190,14 @@ def render_sidebar() -> dict:
 
     st.sidebar.divider()
     st.sidebar.header("Settings")
+    st.sidebar.selectbox("Player detector", ["yolo26s.pt", "yolo26m.pt", "yolo11s.pt", "custom/local"], key="model_choice")
     confidence = st.sidebar.slider("Detection confidence", 0.10, 0.90, DEFAULT_CONFIDENCE_THRESHOLD, 0.05)
     tracker_backend = st.sidebar.selectbox(
         "Tracking backend",
         options=list(TRACKER_BACKENDS),
         index=list(TRACKER_BACKENDS).index(DEFAULT_TRACKER_BACKEND),
-        help="ByteTrack is the default. Try BoT-SORT when player IDs swap during overlaps. Use centroid fallback only if YOLO tracking fails.",
+        format_func=lambda value: "BoT-SORT + appearance matching" if value == DEFAULT_TRACKER_BACKEND else value.replace(".yaml", ""),
+        help="Appearance matching helps retain identity during overlaps. Compare backends on your footage.",
     )
     max_distance = st.sidebar.slider("Fallback tracker match distance (px)", 30.0, 220.0, DEFAULT_MAX_TRACK_DISTANCE_PX, 5.0)
     max_missing = st.sidebar.slider("Fallback keep-lost frames", 1, 60, DEFAULT_MAX_MISSING_FRAMES, 1)
@@ -199,7 +210,7 @@ def render_sidebar() -> dict:
         step=50,
         help="Useful for quick testing on long videos.",
     )
-    use_pose = st.sidebar.checkbox("Use pose model for jump signal when available", value=True)
+    use_pose = st.sidebar.checkbox("Use hand pose around ball contacts", value=True)
 
     return {
         "confidence": float(confidence),
@@ -327,6 +338,75 @@ def render_manual_corner_fallback(frame: np.ndarray) -> None:
                 st.rerun()
 
 
+def render_vertical_calibration(frame: np.ndarray) -> None:
+    st.markdown("#### Height calibration")
+    st.caption("For contact height, click the top of the net tape at the left sideline, then at the right sideline.")
+    net_height = st.radio(
+        "Net height",
+        options=[2.43, 2.24],
+        format_func=lambda value: "Men / coed: 2.43 m" if value == 2.43 else "Women: 2.24 m",
+        horizontal=True,
+    )
+    if float(net_height) != float(st.session_state.net_height_m):
+        st.session_state.projection_matrix_3d = None
+    st.session_state.net_height_m = float(net_height)
+    preview = draw_court_lines(frame, st.session_state.court_to_pixel_matrix)
+    preview = draw_net_calibration(preview, st.session_state.net_top_points)
+    display_bgr, scale = resize_for_display(preview, max_width=900)
+    display_rgb = bgr_to_rgb(display_bgr)
+    if streamlit_image_coordinates is not None:
+        clicked = streamlit_image_coordinates(
+            Image.fromarray(display_rgb),
+            key=f"net_click_{st.session_state.uploaded_signature}_{len(st.session_state.net_top_points)}",
+        )
+        if clicked and len(st.session_state.net_top_points) < 2:
+            st.session_state.net_top_points.append(
+                (int(round(clicked["x"] / scale)), int(round(clicked["y"] / scale)))
+            )
+            st.session_state.projection_matrix_3d = None
+            st.rerun()
+    else:
+        st.image(display_rgb)
+
+    height, width = frame.shape[:2]
+    with st.expander("Enter net points manually"):
+        with st.form("manual_net_points"):
+            defaults = [(int(width * .35), int(height * .47)), (int(width * .65), int(height * .47))]
+            values = []
+            for index in range(2):
+                current = st.session_state.net_top_points[index] if index < len(st.session_state.net_top_points) else defaults[index]
+                col_x, col_y = st.columns(2)
+                x = col_x.number_input(f"Net top {index + 1} x", 0, width - 1, int(current[0]))
+                y = col_y.number_input(f"Net top {index + 1} y", 0, height - 1, int(current[1]))
+                values.append((x, y))
+            if st.form_submit_button("Use these net points"):
+                st.session_state.net_top_points = values
+                st.session_state.projection_matrix_3d = None
+                st.rerun()
+
+    reset_col, confirm_col = st.columns(2)
+    if reset_col.button("Reset net points"):
+        st.session_state.net_top_points = []
+        st.session_state.projection_matrix_3d = None
+        st.rerun()
+    if confirm_col.button("Confirm height calibration", disabled=len(st.session_state.net_top_points) != 2):
+        try:
+            projection, error = build_projection_matrix(
+                st.session_state.court_to_pixel_matrix,
+                st.session_state.net_top_points,
+                st.session_state.net_height_m,
+            )
+            if error > 4:
+                st.error(f"Net calibration does not fit ({error:.1f} px error). Re-select both tape endpoints.")
+            else:
+                st.session_state.projection_matrix_3d = projection
+                st.success(f"Height calibration ready ({error:.1f} px fit error).")
+        except Exception as exc:
+            st.error(f"Height calibration failed: {exc}")
+    if st.session_state.projection_matrix_3d is not None:
+        st.success("Metric height calibration is active.")
+
+
 def render_calibration_step() -> None:
     st.subheader("Step 2 and 3: Select Frame and Mark Court Corners")
     metadata = st.session_state.metadata
@@ -348,6 +428,8 @@ def render_calibration_step() -> None:
         st.session_state.corner_points = []
         st.session_state.pixel_to_court_matrix = None
         st.session_state.court_to_pixel_matrix = None
+        st.session_state.net_top_points = []
+        st.session_state.projection_matrix_3d = None
         st.session_state.preview_records = None
         st.session_state.preview_track_ids = []
         st.session_state.selected_track_id = None
@@ -370,6 +452,8 @@ def render_calibration_step() -> None:
         st.session_state.last_click_signature = None
         st.session_state.pixel_to_court_matrix = None
         st.session_state.court_to_pixel_matrix = None
+        st.session_state.net_top_points = []
+        st.session_state.projection_matrix_3d = None
         st.session_state.preview_records = None
         st.session_state.preview_track_ids = []
         st.session_state.selected_track_id = None
@@ -393,8 +477,13 @@ def render_calibration_step() -> None:
             st.session_state.preview_track_ids = []
             st.session_state.selected_track_id = None
             st.session_state.results = None
+            st.session_state.net_top_points = []
+            st.session_state.projection_matrix_3d = None
             st.success("Court calibration confirmed.")
             st.rerun()
+
+    if st.session_state.court_to_pixel_matrix is not None:
+        render_vertical_calibration(frame)
 
 
 def _load_detector_with_ui():
@@ -408,111 +497,80 @@ def _load_detector_with_ui():
 
 
 def render_tracking_preview(settings: dict) -> None:
-    st.subheader("Step 4: Run Detection and Tracking Preview")
-    if st.session_state.pixel_to_court_matrix is None:
-        st.warning("Confirm court calibration before running tracking.")
-        return
-
+    st.subheader("Step 4: Find Your Team")
     metadata = st.session_state.metadata
-    frame_limit = max(1, int(metadata["fps"] * settings["preview_seconds"]))
-    frame_limit = min(frame_limit, metadata["frame_count"])
-    st.write(f"Preview will process the first {frame_limit} frame(s).")
-
-    if st.button("Run tracking preview", type="primary"):
+    if st.button("Find players", type="primary"):
         model = _load_detector_with_ui()
         if model is None:
             return
-
-        progress = st.progress(0, text="Starting preview tracking...")
-
-        def update_progress(value: float, text: str) -> None:
-            progress.progress(value, text=text)
-
+        progress = st.progress(0.0)
         try:
             records = run_tracking_on_video(
-                video_path=st.session_state.video_path,
-                detector_model=model,
-                pixel_to_court_matrix=st.session_state.pixel_to_court_matrix,
-                confidence_threshold=settings["confidence"],
-                max_distance_px=settings["max_distance"],
-                max_missing_frames=settings["max_missing"],
-                frame_limit=frame_limit,
-                progress_callback=update_progress,
+                st.session_state.video_path, model, st.session_state.pixel_to_court_matrix,
+                settings["confidence"], settings["max_distance"], settings["max_missing"],
+                frame_limit=max(1, int(metadata["fps"] * settings["preview_seconds"])),
                 tracker_backend=settings["tracker_backend"],
+                progress_callback=lambda value, message: progress.progress(value, text=message),
             )
+            if not records:
+                st.error("No players detected. Try a clearer clip or a different detector.")
+                return
+            st.session_state.preview_records = records
+            st.session_state.roster_seeds = None
+            st.session_state.results = None
         except Exception as exc:
+            st.error(str(exc))
+        finally:
             progress.empty()
-            st.error(f"Tracking failed: {exc}")
-            return
-
-        progress.empty()
-        df = records_to_dataframe(records)
-        if df.empty:
-            st.session_state.preview_records = None
-            st.session_state.preview_track_ids = []
-            st.error("No players detected in the preview. Try a lower confidence threshold or a clearer video.")
-            return
-
-        track_counts = df.groupby("track_id").size().sort_values(ascending=False)
-        track_ids = [int(track_id) for track_id in track_counts.index.tolist()]
-        roster_preview = assign_near_side_roster_slots(df)
-        roster_ids = roster_ids_from_dataframe(roster_preview)
-        st.session_state.preview_records = records
-        st.session_state.preview_track_ids = track_ids
-        st.session_state.selected_track_id = track_ids[0] if track_ids else None
-        st.session_state.preview_frame_number = int(df.groupby("frame_number").size().sort_values(ascending=False).index[0])
-        st.success(
-            f"Roster preview built {len(roster_ids)} near-side slot(s): "
-            f"{', '.join(roster_ids) if roster_ids else 'none found yet'}. "
-            f"Raw tracker produced {len(track_ids)} temporary ID(s), kept only as debug data."
-        )
-        st.rerun()
-
-    if st.session_state.preview_records:
-        df = records_to_dataframe(st.session_state.preview_records)
-        roster_preview = assign_near_side_roster_slots(df)
-        roster_ids = roster_ids_from_dataframe(roster_preview)
-        st.success(f"Roster preview: {len(roster_ids)} near-side volleyball slot(s) found: {', '.join(roster_ids) if roster_ids else 'none'}")
-        preview_frame_number = st.session_state.preview_frame_number or int(df["frame_number"].max())
-        frame = cached_extract_frame(st.session_state.video_path, preview_frame_number)
-        if frame is not None:
-            frame_records = roster_preview[roster_preview["frame_number"] == preview_frame_number]
-            preview = draw_court_lines(frame, st.session_state.court_to_pixel_matrix)
-            preview = draw_player_boxes(preview, frame_records, selected_track_id=st.session_state.selected_track_id)
-            st.image(bgr_to_rgb(preview), caption=f"Preview frame {preview_frame_number}: near-side roster slots", use_container_width=True)
-
-        roster_counts = roster_preview[roster_preview["team_player"]].groupby(["roster_id", "roster_zone"]).size().reset_index(name="frames_detected")
-        if not roster_counts.empty:
-            st.dataframe(roster_counts.sort_values("roster_id"), use_container_width=True, hide_index=True)
-
-        with st.expander("Raw YOLO tracklets / debug"):
-            counts = df.groupby("track_id").size().reset_index(name="preview_frames_detected")
-            counts = counts.sort_values("preview_frames_detected", ascending=False)
-            st.dataframe(counts, use_container_width=True, hide_index=True)
+    if not st.session_state.preview_records:
+        return
+    raw = records_to_dataframe(st.session_state.preview_records)
+    eligible = raw[raw.court_x_m.between(-0.75, 9.75) & raw.court_y_m.between(-1.5, 9.0)]
+    if eligible.empty:
+        st.warning("No players inside the near half. Check your court corners.")
+        return
+    frames = sorted(eligible.frame_number.unique().tolist())
+    best = int(eligible.groupby("frame_number").size().idxmax())
+    frame_number = st.select_slider("Team selection frame", options=frames, value=best)
+    candidates = eligible[eligible.frame_number == frame_number].sort_values("court_x_m")
+    frame = cached_extract_frame(st.session_state.video_path, int(frame_number))
+    if frame is not None:
+        preview = draw_court_lines(frame, st.session_state.court_to_pixel_matrix)
+        st.image(bgr_to_rgb(draw_player_boxes(preview, candidates)), use_container_width=True)
+    choices = candidates.track_id.astype(int).tolist()
+    with st.form("lock_roster"):
+        seeds = st.multiselect("Your six players in this frame", choices, default=choices[:6], max_selections=6)
+        confirmed = st.form_submit_button("Lock these players", type="primary")
+    if confirmed:
+        if len(seeds) != 6:
+            st.warning("Choose all six teammates. Try another frame if someone is hidden.")
+        else:
+            st.session_state.roster_seeds = seeds
+            st.session_state.selected_track_id = 1
+            st.session_state.results = None
+    if st.session_state.roster_seeds:
+        team = team_records(raw, st.session_state.roster_seeds)
+        st.session_state.preview_track_ids = sorted(team.track_id.unique().tolist())
+        st.success("Six-player roster locked.")
+        st.dataframe(pd.DataFrame({
+            "Player": [f"P{i+1}" for i in range(6)],
+            "Selection label": st.session_state.roster_seeds,
+        }), hide_index=True)
 
 
 def render_player_selection() -> None:
-    st.subheader("Step 5: Optional Selected Player Overlay")
-    track_ids = st.session_state.preview_track_ids
-    if not track_ids:
-        st.info("Run the tracking preview first. The full report will focus on the six near-side volleyball slots, not every temporary raw tracker ID.")
+    st.subheader("Step 5: Select Player")
+    if not st.session_state.roster_seeds:
+        st.info("Lock your six players above before generating a report.")
         return
-
-    current = st.session_state.selected_track_id if st.session_state.selected_track_id in track_ids else track_ids[0]
-    selected = st.selectbox(
-        "Optional raw track ID for one highlighted trail",
-        options=track_ids,
-        index=track_ids.index(current),
-        help="The main analytics use Z1-Z6 team slots. This only chooses one raw YOLO track to highlight in the video overlay.",
-    )
-    st.session_state.selected_track_id = int(selected)
-    st.success(f"Optional highlight track: {selected}. Team metrics will still use Z1-Z6.")
+    selected = st.selectbox("Player to highlight", list(range(1, 7)), format_func=lambda value: f"P{value}")
+    st.session_state.selected_track_id = selected
 
 
 def render_output_generation(settings: dict) -> None:
     st.subheader("Step 6: Generate Outputs")
-    if st.session_state.selected_track_id is None:
-        st.warning("Select a player before generating outputs.")
+    if not st.session_state.roster_seeds:
+        st.warning("Lock your six-player roster before generating outputs.")
         return
 
     if not st.button("Process full video and create outputs", type="primary"):
@@ -549,7 +607,7 @@ def render_output_generation(settings: dict) -> None:
             max_missing_frames=settings["max_missing"],
             frame_limit=settings["full_frame_limit"],
             progress_callback=tracking_update,
-            pose_model=pose_model,
+            pose_model=None,
             selected_track_id=selected_id,
             tracker_backend=settings["tracker_backend"],
         )
@@ -559,7 +617,8 @@ def render_output_generation(settings: dict) -> None:
         return
 
     tracking_progress.empty()
-    df = records_to_dataframe(records, selected_track_id=selected_id)
+    df = team_records(records_to_dataframe(records), st.session_state.roster_seeds)
+    df["selected_player"] = df.track_id == selected_id
     if df.empty:
         st.error("No players were detected, so outputs could not be generated.")
         return
@@ -572,9 +631,7 @@ def render_output_generation(settings: dict) -> None:
     df = add_jump_annotations(df, selected_id, jump_events, jump_note)
     jump_summary = summarise_jumps(jump_events, jump_note)
 
-    df = assign_near_side_roster_slots(df)
     roster_ids = roster_ids_from_dataframe(df)
-    team_track_ids = select_near_side_team(df, max_players=6)
     if len(roster_ids) < 6:
         st.warning(f"Built {len(roster_ids)} near-side roster slot(s). For best results use a centred back-view clip where all six players are visible.")
     player_table = estimate_player_table(df, roster_ids, metadata["fps"], id_column="roster_id")
@@ -588,7 +645,7 @@ def render_output_generation(settings: dict) -> None:
     if ball_model is not None:
         st.caption(f"Ball model: {ball_source}")
     else:
-        st.info("YOLO ball model unavailable. Using a classical moving bright-object ball fallback instead.")
+        st.info("Ball model unavailable. Ball results will remain empty; player movement can still be exported.")
 
     ball_progress = st.progress(0, text="Tracking ball...")
 
@@ -605,7 +662,16 @@ def render_output_generation(settings: dict) -> None:
     )
     ball_progress.empty()
     ball_df = ball_records_to_dataframe(ball_records)
-    contacts_df = estimate_contacts(df, ball_df, roster_ids, metadata["fps"])
+    if pose_model is not None and not ball_df.empty:
+        pose_progress = st.progress(0, text="Checking hands near the tracked ball...")
+        df = enrich_hands_near_ball(
+            st.session_state.video_path, df, ball_df, pose_model,
+        )
+        pose_progress.empty()
+    contacts_df = estimate_contacts(
+        df, ball_df, roster_ids, metadata["fps"],
+        projection_matrix_3d=st.session_state.projection_matrix_3d,
+    )
     box_score_df = estimate_team_box_score(player_table, contacts_df)
 
     try:
@@ -638,6 +704,7 @@ def render_output_generation(settings: dict) -> None:
             progress_callback=video_update,
             ball_df=ball_df,
             team_track_ids=roster_ids,
+            contacts_df=contacts_df,
         )
     except Exception as exc:
         video_progress.empty()
@@ -701,13 +768,32 @@ def render_results() -> None:
     max_jump = jumps.get("max_jump_height_m")
     col5.metric("Selected max jump", "N/A" if max_jump is None else f"{max_jump:.2f} m")
 
-    st.caption("Back-view roster mode: raw tracker IDs are collapsed into six court-role slots Z1-Z6. Ball/contact stats are heuristic unless you provide a volleyball-trained ball model.")
+    st.caption("P1-P6 are locked player identities. Missing observations remain gaps. Contact events need review before use as official statistics.")
     st.caption(metrics.get("note", ""))
     st.caption(jumps.get("note", ""))
 
     if box_score_df is not None and not box_score_df.empty:
-        st.subheader("Near-Side Team Box Score")
+        st.subheader("Automatic Contact Estimates (Unreviewed)")
         st.dataframe(box_score_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Reviewed Volleyball Stat Sheet")
+    st.caption("Enter one row per action. A kill or attack error already counts as an attack attempt. Only checked rows count.")
+    events = st.data_editor(
+        pd.DataFrame(columns=["Time (s)", "Player", "Event", "Reviewed"]),
+        key="reviewed_events_" + str(st.session_state.uploaded_signature),
+        num_rows="dynamic",
+        column_config={
+            "Time (s)": st.column_config.NumberColumn(min_value=0.0),
+            "Player": st.column_config.SelectboxColumn(options=[f"P{i}" for i in range(1, 7)], required=True),
+            "Event": st.column_config.SelectboxColumn(options=EVENTS, required=True),
+            "Reviewed": st.column_config.CheckboxColumn(default=False),
+        },
+        hide_index=True,
+    )
+    sheet = build_stat_sheet(events, [f"P{i}" for i in range(1, 7)])
+    st.dataframe(sheet, hide_index=True)
+    st.download_button("Download reviewed stat sheet", sheet.to_csv(index=False), "reviewed_stat_sheet.csv", "text/csv")
+    st.download_button("Download reviewed events", events.to_csv(index=False), "reviewed_events.csv", "text/csv")
 
     if results.get("player_table") is not None and not results["player_table"].empty:
         st.subheader("Team Player Movement")
@@ -755,17 +841,28 @@ def render_results() -> None:
 def main() -> None:
     ensure_workspace_directories()
     initialise_state()
+    if st.session_state.get("build_version") != "foundation-3":
+        for key, value in STATE_DEFAULTS.items():
+            st.session_state[key] = value.copy() if isinstance(value, list) else value
+        st.session_state.build_version = "foundation-3"
 
     st.title("AI Volleyball Back-View Team Analyzer")
-    st.markdown("### Six-player near-side roster tracking, court calibration, ball trajectory, contact-height estimates, and volleyball-style stat sheets.")
-    st.info("Built for a camera behind your team. Raw YOLO tracklets are collapsed into fixed volleyball zones Z1-Z6, so the report follows the six near-side players instead of dozens of temporary IDs.")
+    st.caption("Analysis foundation 3.0 | Fixed camera behind the baseline")
+    st.info("Lock your six teammates, then review their movement and candidate ball contacts. Estimates need review before use as official statistics.")
     mode_cols = st.columns(4)
     mode_cols[0].metric("Primary mode", "Back-view")
     mode_cols[1].metric("Team focus", "6 slots")
-    mode_cols[2].metric("Identity layer", "Z1-Z6")
+    mode_cols[2].metric("Player identities", "P1-P6")
     mode_cols[3].metric("Ball path", "YOLO + CV")
 
     settings = render_sidebar()
+    signature = (st.session_state.get("model_choice"), tuple(settings.items()))
+    if st.session_state.get("pipeline_signature") != signature:
+        st.session_state.preview_records = None
+        st.session_state.preview_track_ids = []
+        st.session_state.roster_seeds = None
+        st.session_state.results = None
+        st.session_state.pipeline_signature = signature
 
     render_upload_step()
     if st.session_state.video_path is None:

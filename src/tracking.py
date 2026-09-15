@@ -8,7 +8,7 @@ import numpy as np
 
 from .calibration import map_pixel_to_court
 from .config import COURT_BOUNDARY_MARGIN_M, COURT_LENGTH_M, COURT_WIDTH_M, DEFAULT_FPS
-from .detection import Detection, detect_players, estimate_pose_vertical_signal
+from .detection import Detection, detect_players, estimate_pose_features
 
 
 @dataclass
@@ -201,13 +201,15 @@ def observation_to_record(
 
     vertical_signal_y = center_y
     vertical_signal_source = "bbox_center"
-    if selected_track_id is not None and observation.track_id == selected_track_id and frame is not None and pose_model is not None:
-        pose_signal = estimate_pose_vertical_signal(pose_model, frame, observation.bbox)
+    pose_features = {}
+    if frame is not None and pose_model is not None:
+        pose_features = estimate_pose_features(pose_model, frame, observation.bbox)
+        pose_signal = pose_features.get("pose_com_y")
         if pose_signal is not None and np.isfinite(pose_signal):
             vertical_signal_y = float(pose_signal)
             vertical_signal_source = "pose_com"
 
-    return {
+    record = {
         "frame_number": int(observation.frame_number),
         "timestamp_seconds": round(float(observation.timestamp_seconds), 4),
         "track_id": int(observation.track_id),
@@ -227,6 +229,13 @@ def observation_to_record(
         "vertical_signal_source": vertical_signal_source,
         "notes": _court_note(court_x, court_y),
     }
+    record.update({
+        "left_wrist_x": pose_features.get("left_wrist_x", np.nan),
+        "left_wrist_y": pose_features.get("left_wrist_y", np.nan),
+        "right_wrist_x": pose_features.get("right_wrist_x", np.nan),
+        "right_wrist_y": pose_features.get("right_wrist_y", np.nan),
+    })
+    return record
 
 
 def run_tracking_on_video(
@@ -257,6 +266,11 @@ def run_tracking_on_video(
     frame_number = 0
     yolo_tracker_failed = False
 
+    if use_yolo_tracker:
+        detector_model.predictor = None
+        detector_model.callbacks.pop("on_predict_start", None)
+        detector_model.callbacks.pop("on_predict_postprocess_end", None)
+
     try:
         while True:
             if frame_limit is not None and frame_number >= frame_limit:
@@ -275,12 +289,12 @@ def run_tracking_on_video(
                         persist=frame_number > 0,
                         tracker=tracker_backend,
                         conf=confidence_threshold,
+                        imgsz=1280,
                         verbose=False,
                     )
                     observations = _observations_from_tracked_result(results[0], detector_model, frame_number, timestamp) if results else []
-                except Exception:
-                    yolo_tracker_failed = True
-                    observations = []
+                except Exception as exc:
+                    raise RuntimeError(f"Tracking backend failed: {exc}. Choose ByteTrack or the explicit centroid fallback in Settings and rerun the preview.") from exc
 
             if not use_yolo_tracker or yolo_tracker_failed:
                 detections = detect_players(detector_model, frame, confidence_threshold=confidence_threshold)
@@ -308,4 +322,3 @@ def run_tracking_on_video(
         cap.release()
 
     return records
-
